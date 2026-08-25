@@ -3631,6 +3631,69 @@
             height: 17px;
         }
 
+        .update-release-notes {
+            display: grid;
+            gap: 8px;
+            padding: 11px 12px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: color-mix(in srgb, var(--control-bg) 58%, var(--panel));
+        }
+
+        .update-release-notes__head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .update-release-notes__title {
+            color: var(--text);
+            font-size: .72rem;
+            font-weight: 850;
+        }
+
+        .update-release-notes__link {
+            color: var(--accent);
+            font-size: .68rem;
+            font-weight: 750;
+            text-decoration: none;
+            white-space: nowrap;
+        }
+
+        .update-release-notes__link:hover {
+            color: var(--accent-strong);
+            text-decoration: underline;
+            text-underline-offset: 3px;
+        }
+
+        .update-release-notes__list {
+            display: grid;
+            gap: 6px;
+            margin: 0;
+            padding: 0;
+            list-style: none;
+        }
+
+        .update-release-notes__item {
+            position: relative;
+            padding-left: 13px;
+            color: var(--muted);
+            font-size: .72rem;
+            line-height: 1.5;
+        }
+
+        .update-release-notes__item::before {
+            position: absolute;
+            top: .58em;
+            left: 1px;
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--accent);
+            content: "";
+        }
+
         .update-center-card__notice {
             display: flex;
             align-items: flex-start;
@@ -5602,6 +5665,16 @@
                                             </div>
                                         </div>
                                     </div>
+                                </div>
+
+                                <div v-if="updateInfo.latest?.notes?.length" class="update-release-notes">
+                                    <div class="update-release-notes__head">
+                                        <strong class="update-release-notes__title">更新内容</strong>
+                                        <a v-if="updateInfo.latest?.url" :href="updateInfo.latest.url" target="_blank" rel="noopener noreferrer" class="update-release-notes__link">查看完整说明</a>
+                                    </div>
+                                    <ul class="update-release-notes__list">
+                                        <li v-for="(note, index) in updateInfo.latest.notes" :key="`${index}-${note}`" class="update-release-notes__item">{{ note }}</li>
+                                    </ul>
                                 </div>
 
                                 <div v-if="updateState.status === 'error'" class="update-center-card__notice is-error">

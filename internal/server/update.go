@@ -22,13 +22,37 @@ const defaultUpdateRepo = "elunez/ecs-controller"
 
 var commitPattern = regexp.MustCompile(`^[a-fA-F0-9]{40}$`)
 var versionTagPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+var releaseNoteCommitLinkPattern = regexp.MustCompile(`\s*\(\[[^]]+\]\([^)]+\)\)\s*$`)
 
 type githubRelease struct {
 	TagName string `json:"tag_name"`
 	HTMLURL string `json:"html_url"`
+	Body    string `json:"body"`
 	Assets  []struct {
 		Name string `json:"name"`
 	} `json:"assets"`
+}
+
+func summarizeReleaseNotes(body string) []string {
+	notes := make([]string, 0, 6)
+	for _, rawLine := range strings.Split(body, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if !strings.HasPrefix(line, "- ") && !strings.HasPrefix(line, "* ") {
+			continue
+		}
+		line = strings.TrimSpace(line[2:])
+		line = releaseNoteCommitLinkPattern.ReplaceAllString(line, "")
+		line = strings.NewReplacer("**", "", "`", "").Replace(line)
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		notes = append(notes, line)
+		if len(notes) == cap(notes) {
+			break
+		}
+	}
+	return notes
 }
 
 type githubCommit struct {
@@ -201,6 +225,7 @@ func (s *Server) checkForUpdate(w http.ResponseWriter, r *http.Request) {
 		"version": release.TagName,
 		"commit":  latest.SHA,
 		"message": strings.TrimSpace(strings.Split(latest.Commit.Message, "\n")[0]),
+		"notes":   summarizeReleaseNotes(release.Body),
 		"url":     fallback(release.HTMLURL, latest.HTMLURL),
 	}
 	result["package_available"] = packageAvailable

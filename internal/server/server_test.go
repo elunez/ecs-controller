@@ -117,6 +117,7 @@ func TestCheckForUpdateUsesGitHubReleaseTagsAsDisplayVersions(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"tag_name": "v1.6.40",
 				"html_url": "https://github.com/elunez/ecs-controller/releases/tag/v1.6.40",
+				"body":     "## 更新内容\n\n- **展示版本更新说明** ([abc1234](https://github.com/elunez/ecs-controller/commit/abc1234))",
 				"assets": []map[string]any{
 					{"name": "ecs-controller-linux-amd64.tar.gz"},
 					{"name": "checksums.txt"},
@@ -165,6 +166,10 @@ func TestCheckForUpdateUsesGitHubReleaseTagsAsDisplayVersions(t *testing.T) {
 	latest, ok := result["latest"].(map[string]any)
 	if !ok || latest["version"] != "v1.6.40" {
 		t.Fatalf("latest=%#v, want v1.6.40", result["latest"])
+	}
+	notes, ok := latest["notes"].([]any)
+	if !ok || len(notes) != 1 || notes[0] != "展示版本更新说明" {
+		t.Fatalf("notes=%#v, want release summary", latest["notes"])
 	}
 }
 
