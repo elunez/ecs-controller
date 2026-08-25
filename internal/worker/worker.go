@@ -90,6 +90,7 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 	if interval < 30*time.Second {
 		interval = 30 * time.Second
 	}
+	w.Store.SetLastRun()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

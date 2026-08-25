@@ -2698,11 +2698,12 @@
         .page-header {
             position: relative;
             overflow: hidden;
+            border-color: color-mix(in srgb, var(--accent) 16%, var(--line));
             border-radius: 14px;
-            padding: 18px 22px;
-            background:
-                radial-gradient(circle at 96% 16%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 23%),
-                color-mix(in srgb, var(--panel) 94%, var(--accent) 6%);
+            padding: 16px 20px;
+            background: linear-gradient(90deg,
+                    color-mix(in srgb, var(--panel) 96%, var(--accent) 4%),
+                    color-mix(in srgb, var(--panel) 90%, var(--accent) 10%));
             animation: panel-fade-up .25s ease both;
         }
 
@@ -2712,7 +2713,7 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 20px;
+            gap: 18px;
         }
 
         .page-brand {
@@ -2722,48 +2723,48 @@
         .brand-lockup {
             display: flex;
             align-items: center;
-            gap: 14px;
+            gap: 13px;
         }
 
         .brand-logo {
-            width: 62px;
-            height: 62px;
-            flex: 0 0 62px;
-            padding: 7px;
-            border-radius: 18px;
+            width: 56px;
+            height: 56px;
+            flex: 0 0 56px;
+            padding: 6px;
+            border-radius: 16px;
             object-fit: contain;
             background: #ffffff;
             border: 1px solid var(--line);
-            box-shadow: 0 14px 30px color-mix(in srgb, var(--accent) 12%, transparent);
+            box-shadow: 0 10px 24px color-mix(in srgb, var(--accent) 12%, transparent);
         }
 
         .brand-logo-fallback {
-            width: 62px;
-            height: 62px;
-            flex: 0 0 62px;
-            border-radius: 18px;
+            width: 56px;
+            height: 56px;
+            flex: 0 0 56px;
+            border-radius: 16px;
             background: var(--accent-strong);
             color: #ffffff;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.1rem;
+            font-size: 1.05rem;
             font-weight: 900;
         }
 
         .brand-copy__title {
             margin: 0;
             color: var(--text);
-            font-size: clamp(1.35rem, 2.1vw, 1.8rem);
+            font-size: clamp(1.3rem, 2vw, 1.65rem);
             font-weight: 900;
             letter-spacing: -0.045em;
-            line-height: 1.05;
+            line-height: 1.06;
         }
 
         .brand-copy__description {
-            margin: 0.4rem 0 0;
+            margin: 0.35rem 0 0;
             color: var(--muted);
-            font-size: 0.8rem;
+            font-size: 0.79rem;
             line-height: 1.5;
         }
 
@@ -2788,8 +2789,28 @@
             display: flex;
             align-items: center;
             justify-content: flex-end;
-            gap: 10px;
-            flex-wrap: wrap;
+            gap: 9px;
+            flex-wrap: nowrap;
+        }
+
+        .page-actions .chip,
+        .page-actions .full-width-button {
+            min-height: 36px;
+            border-radius: 9px;
+            white-space: nowrap;
+        }
+
+        .page-actions .chip {
+            padding: 0 11px;
+            background: color-mix(in srgb, var(--panel) 90%, transparent);
+            font-size: 0.73rem;
+            font-weight: 700;
+        }
+
+        .page-actions .full-width-button {
+            min-width: 108px;
+            padding: 0 16px;
+            font-size: 0.76rem;
         }
 
         .status-dot {
@@ -3893,17 +3914,6 @@
                 color-mix(in srgb, var(--accent-light) 30%, var(--panel));
         }
 
-        .about-hero::after {
-            position: absolute;
-            right: 18px;
-            bottom: -38px;
-            width: 120px;
-            height: 120px;
-            border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
-            border-radius: 50%;
-            content: "";
-        }
-
         .about-hero__mark {
             display: grid;
             place-items: center;
@@ -4212,7 +4222,7 @@
 
         @media (max-width: 1023px) {
             .page-header {
-                padding: 22px;
+                padding: 15px 18px;
             }
 
             .settings-layout {
@@ -4236,15 +4246,6 @@
             .settings-nav__button {
                 min-width: 176px;
                 flex: 0 0 176px;
-            }
-
-            .page-header__row {
-                flex-direction: column;
-            }
-
-            .page-actions {
-                width: 100%;
-                justify-content: flex-start;
             }
 
             .section-panel {

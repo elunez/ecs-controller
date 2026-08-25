@@ -147,6 +147,22 @@ func (f *fakeReusableCloud) PrepareReusableNetworkForPort(_ context.Context, _, 
 	return f.network, nil
 }
 
+func TestMonitorRecordsHeartbeatImmediately(t *testing.T) {
+	s, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	startedAt := time.Now().Unix()
+	(&Worker{Store: s}).Monitor(ctx, time.Minute)
+	if got := s.LastRun(); got < startedAt {
+		t.Fatalf("expected startup heartbeat at or after %d, got %d", startedAt, got)
+	}
+}
+
 func TestDailyTrafficEventSeparatesCMSYesterdayAndCDTCurrentUsage(t *testing.T) {
 	s, err := store.Open(t.TempDir())
 	if err != nil {
