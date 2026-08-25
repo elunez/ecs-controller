@@ -17,7 +17,52 @@ curl -fsSL https://raw.githubusercontent.com/elunez/ecs-controller/main/install.
 
 安装脚本会自动识别处理器架构，从 GitHub Release 下载并校验预构建程序，然后创建系统服务并启动。服务器不需要安装 Docker、Git 或 Go。
 
-程序安装在 `/opt/ecs-controller`，数据保存在 `/var/lib/ecs-controller`。服务默认只监听服务器本机的 `43211` 端口，请通过你现有的 HTTPS 访问方式打开面板，不要直接开放这个端口。
+`ECS_COOKIE_SECURE=1` 表示登录 Cookie 只允许通过 HTTPS 传输。使用域名、反向代理或 Cloudflare 并由浏览器通过 HTTPS 访问时，建议保持为 `1`；反向代理到程序内部使用 HTTP 不受影响。如果直接使用 HTTP 访问，请不要设置该变量：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/elunez/ecs-controller/main/install.sh \
+  | sudo sh
+```
+
+HTTP 环境错误设置为 `1` 时，可能出现登录成功后立即变成未登录。安装时的设置会写入 `/etc/ecs-controller/ecs-controller.env`。
+
+### 安装目录
+
+- 稳定的程序入口：`/opt/ecs-controller/current/ecs-controller`
+- 实际版本文件：`/opt/ecs-controller/releases/<提交 SHA>/`
+- 后台更新程序：`/opt/ecs-controller/updater.sh`
+- SQLite 数据库：`/var/lib/ecs-controller/data.sqlite`
+- 凭据加密密钥：`/var/lib/ecs-controller/.secret_encryption.key`
+- 在线更新状态：`/var/lib/ecs-controller/update/`
+- 运行配置：`/etc/ecs-controller/ecs-controller.env`
+
+备份时必须同时备份 `data.sqlite` 和 `.secret_encryption.key`，否则数据库中的 AccessKey Secret 等加密内容可能无法恢复。
+
+### 服务管理
+
+使用 systemd 的 Debian、Ubuntu、CentOS、Rocky Linux 等系统：
+
+```bash
+sudo systemctl restart ecs-controller
+sudo systemctl status ecs-controller
+sudo systemctl stop ecs-controller
+sudo systemctl start ecs-controller
+sudo journalctl -u ecs-controller -f
+```
+
+使用 OpenRC 的 Alpine Linux：
+
+```bash
+sudo rc-service ecs-controller restart
+sudo rc-service ecs-controller status
+sudo rc-service ecs-controller stop
+sudo rc-service ecs-controller start
+sudo tail -f /var/log/ecs-controller.log
+```
+
+修改 `/etc/ecs-controller/ecs-controller.env` 后，需要执行对应系统的重启命令才能生效。后台在线更新服务名为 `ecs-controller-updater`，一般不需要手动操作。
+
+服务默认只监听服务器本机的 `43211` 端口，请通过你现有的 HTTPS 访问方式打开面板，不要直接开放这个端口。
 
 公网使用 Passkey 时必须使用 HTTPS。
 
@@ -85,4 +130,5 @@ curl -fsSL https://raw.githubusercontent.com/elunez/ecs-controller/main/install.
 
 - 项目地址：https://github.com/elunez/ecs-controller
 - 问题反馈：https://github.com/elunez/ecs-controller/issues
+- 原版项目：https://github.com/Kori1c/ecs-controller
 - 许可证：[MIT](./LICENSE)
