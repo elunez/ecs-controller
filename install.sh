@@ -51,7 +51,7 @@ install_dependencies() {
     if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
         missing=1
     fi
-    [ "$missing" -eq 1 ] || return
+    [ "$missing" -eq 1 ] || return 0
 
     echo "正在安装 curl、证书和解压工具..."
     if command -v apt-get >/dev/null 2>&1; then
