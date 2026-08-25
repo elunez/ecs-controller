@@ -43,3 +43,33 @@ func TestCloudflareUpdateDeleteAndAutoResolveZone(t *testing.T) {
 		t.Fatalf("requests: %#v", requests)
 	}
 }
+
+func TestCloudflareUpdateUsesConfiguredTTLUnlessProxied(t *testing.T) {
+	var ttls []float64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": []any{}})
+			return
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		ttls = append(ttls, payload["ttl"].(float64))
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": map[string]any{}})
+	}))
+	defer server.Close()
+	client := NewCloudflareClient("token", "zone-1", "example.com")
+	client.BaseURL = server.URL
+	client.HTTPClient = server.Client()
+	if err := client.UpdateWithTTL(context.Background(), "service.example.com", "203.0.113.10", 300, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.UpdateWithTTL(context.Background(), "service.example.com", "203.0.113.10", 300, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(ttls) != 2 || ttls[0] != 300 || ttls[1] != 1 {
+		t.Fatalf("unexpected TTLs: %#v", ttls)
+	}
+}

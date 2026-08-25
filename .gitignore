@@ -5,17 +5,20 @@ config.json
 Thumbs.db
 /.idea
 /.vscode
+/.codegraph/
 /vendor
 /.secret_encryption.key
 /.settings
 /.buildpath
 /.project
 /node_modules
+/dist/
 package.json
 package-lock.json
 static/tailwindcss-browser.js
 
 # Local runtime data
+/.local/
 /data/
 data.reset-backup*/
 test_deploy/

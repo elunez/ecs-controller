@@ -546,7 +546,7 @@ func (w *Worker) controlTelegramAccount(ctx context.Context, id int64, action st
 		if a.InstanceStatus != "Running" {
 			return fmt.Errorf("当前状态为 %s", statusLabel(a.InstanceStatus))
 		}
-		err = client.StopInstance(ctx, a.RegionID, a.InstanceID, "KeepCharging")
+		err = client.StopInstance(ctx, a.RegionID, a.InstanceID, app.ResolveShutdownMode(a.StoppedMode, w.Store.GetSetting("shutdown_mode", "KeepCharging")))
 		if err == nil {
 			a.InstanceStatus = "Stopping"
 		}
@@ -578,11 +578,7 @@ func (w *Worker) enqueueTelegramDelete(id int64) error {
 }
 
 func (w *Worker) clientForAccount(a app.Account) cloud.Client {
-	client := w.Cloud
-	if w.CloudFactory != nil {
-		client = w.CloudFactory(app.AccountGroup{AccessKeyID: a.AccessKeyID, AccessKeySecret: a.AccessKeySecret, RegionID: a.RegionID, SiteType: a.SiteType})
-	}
-	return client
+	return w.cloudClient(app.AccountGroup{AccessKeyID: a.AccessKeyID, AccessKeySecret: a.AccessKeySecret, RegionID: a.RegionID, SiteType: a.SiteType})
 }
 
 func (w *Worker) telegramConfirmTTL() time.Duration {

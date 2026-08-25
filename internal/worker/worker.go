@@ -16,10 +16,67 @@ import (
 )
 
 type Worker struct {
-	Store        *store.Store
-	Cloud        cloud.Client
-	CloudFactory func(app.AccountGroup) cloud.Client
-	Log          *log.Logger
+	Store         *store.Store
+	CloudFactory  func(app.AccountGroup) cloud.Client
+	InventorySync func(context.Context) (int, error)
+	Log           *log.Logger
+}
+
+func (w *Worker) cloudClient(group app.AccountGroup) cloud.Client {
+	if w.CloudFactory == nil {
+		return nil
+	}
+	return w.CloudFactory(group)
+}
+
+// InventoryMonitor periodically reconciles the complete ECS list for every
+// configured account group. It runs independently from the per-instance
+// status/traffic monitor so a slow list operation cannot delay automation.
+func (w *Worker) InventoryMonitor(ctx context.Context, checkInterval time.Duration) {
+	if checkInterval < 30*time.Second {
+		checkInterval = 30 * time.Second
+	}
+	w.runInventorySync(ctx, time.Now())
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			w.runInventorySync(ctx, now)
+		}
+	}
+}
+
+func (w *Worker) runInventorySync(ctx context.Context, now time.Time) bool {
+	if w.InventorySync == nil || w.Store.GetSetting("inventory_sync_enabled", "1") != "1" {
+		return false
+	}
+	intervalSeconds, _ := strconv.ParseInt(w.Store.GetSetting("inventory_sync_interval", "3600"), 10, 64)
+	if intervalSeconds < 1800 || intervalSeconds > 86400 {
+		intervalSeconds = 3600
+	}
+	lastAttempt, _ := strconv.ParseInt(w.Store.GetSetting("inventory_sync_last_attempt", "0"), 10, 64)
+	if lastAttempt > 0 && now.Unix()-lastAttempt < intervalSeconds {
+		return false
+	}
+	_ = w.Store.SetSetting("inventory_sync_last_attempt", strconv.FormatInt(now.Unix(), 10))
+	count, err := w.InventorySync(ctx)
+	if err != nil {
+		failures, _ := strconv.Atoi(w.Store.GetSetting("inventory_sync_failures", "0"))
+		failures++
+		_ = w.Store.SetSetting("inventory_sync_failures", strconv.Itoa(failures))
+		w.Store.AddLog("warning", "账号实例清单自动同步失败: "+err.Error())
+		if failures == 3 {
+			w.dispatchEvent(ctx, notify.Event{Title: "账号实例清单同步失败", Summary: "已连续 3 次同步失败，请检查阿里云凭据和网络。", Text: "【ECS 控制台】账号实例清单自动同步已连续 3 次失败\n错误: " + err.Error(), Fields: map[string]string{"error": err.Error()}})
+		}
+		return true
+	}
+	_ = w.Store.SetSetting("inventory_sync_failures", "0")
+	_ = w.Store.SetSetting("inventory_sync_last_success", strconv.FormatInt(now.Unix(), 10))
+	w.Store.AddLog("info", fmt.Sprintf("账号实例清单自动同步完成：共发现 %d 台实例。", count))
+	return true
 }
 
 func cmsTrafficErrorMessage(err error) string {
@@ -63,13 +120,6 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 				continue
 			}
 			w.Store.AddLog("heartbeat", fmt.Sprintf("监控心跳正常：已检查 %d 个监控账号。", len(accounts)))
-			if w.ddnsEnabled() {
-				lastDDNS, _ := strconv.ParseInt(w.Store.GetSetting("last_ddns_reconcile", "0"), 10, 64)
-				if now.Unix()-lastDDNS >= 6*60*60 {
-					w.syncAllDDNS(ctx)
-					_ = w.Store.SetSetting("last_ddns_reconcile", strconv.FormatInt(now.Unix(), 10))
-				}
-			}
 			threshold, _ := strconv.ParseFloat(w.Store.GetSetting("traffic_threshold", "95"), 64)
 			if threshold <= 0 || threshold > 100 {
 				threshold = 95
@@ -87,10 +137,7 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 				if account.InstanceID == "" {
 					continue
 				}
-				client := w.Cloud
-				if w.CloudFactory != nil {
-					client = w.CloudFactory(app.AccountGroup{AccessKeyID: account.AccessKeyID, AccessKeySecret: account.AccessKeySecret, RegionID: account.RegionID, SiteType: account.SiteType})
-				}
+				client := w.cloudClient(app.AccountGroup{AccessKeyID: account.AccessKeyID, AccessKeySecret: account.AccessKeySecret, RegionID: account.RegionID, SiteType: account.SiteType})
 				if client == nil {
 					continue
 				}
@@ -104,8 +151,8 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 				oldStatus := account.InstanceStatus
 				instance, describeErr := client.DescribeInstance(ctx, account.RegionID, account.InstanceID)
 				if describeErr != nil {
-					if removed, cleanupErr := w.cleanupMissingReleaseFailed(account, describeErr); cleanupErr != nil {
-						w.Store.AddLog("warning", "清理释放失败残留记录失败: "+cleanupErr.Error())
+					if removed, cleanupErr := w.queueMissingInstanceCleanup(account, describeErr); cleanupErr != nil {
+						w.Store.AddLog("warning", "清理云端不存在的实例记录失败: "+cleanupErr.Error())
 					} else if removed {
 						continue
 					}
@@ -192,7 +239,6 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 					w.Store.AddLog("error", "保存监控状态失败: "+err.Error())
 				}
 				if account.PublicIP != "" && account.PublicIP != oldPublicIP {
-					w.syncDDNSAccount(ctx, account)
 					w.dispatchEvent(ctx, notify.Event{Title: "公网 IP 已变化", Summary: fmt.Sprintf("%s 公网 IP 已从 %s 变为 %s", accountLabel(account), oldPublicIP, account.PublicIP), AccountID: accountLabel(account), Text: fmt.Sprintf("【ECS 控制台】公网 IP 已变化\n实例: %s\n实例 ID: %s\n旧 IP: %s\n新 IP: %s\n时间: %s", accountLabel(account), account.InstanceID, oldPublicIP, account.PublicIP, time.Now().Format("2006-01-02 15:04:05")), Fields: map[string]string{"old_ip": oldPublicIP, "new_ip": account.PublicIP, "instance_id": account.InstanceID}})
 				}
 			}
@@ -201,19 +247,18 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// cleanupMissingReleaseFailed retires a terminal local release failure after
-// the per-instance API confirms that the exact cloud instance is gone. This
-// deliberately does not touch EIPs or other resources because an address may
-// already have been reused by a replacement instance.
-func (w *Worker) cleanupMissingReleaseFailed(account app.Account, describeErr error) (bool, error) {
-	if account.InstanceStatus != "ReleaseFailed" || !cloud.IsNotFound(describeErr) {
+// queueMissingInstanceCleanup hides a stale row as soon as the per-instance
+// API confirms the exact ECS ID no longer exists. Remaining managed-resource
+// and rotation-group cleanup is performed by the retryable delete job.
+func (w *Worker) queueMissingInstanceCleanup(account app.Account, describeErr error) (bool, error) {
+	if !cloud.IsNotFound(describeErr) {
 		return false, nil
 	}
-	removed, err := w.Store.PhysicallyDeleteReleaseFailed(account.ID)
-	if err == nil && removed {
-		w.Store.AddLog("info", "已清理云端不存在的释放失败残留记录: "+account.InstanceID)
+	if err := w.Store.QueueMissingInstanceCleanup(account.ID, randomActionToken()); err != nil {
+		return false, err
 	}
-	return removed, err
+	w.Store.AddLog("info", "已同步移除云端不存在的实例: "+account.InstanceID)
+	return true, nil
 }
 
 func (w *Worker) protectionTraffic(ctx context.Context, client cloud.Client, account app.Account, cmsTraffic float64) (float64, string) {
@@ -277,6 +322,8 @@ func trafficFloat(value any) float64 {
 }
 
 func (w *Worker) runCachedAutomation(ctx context.Context, client cloud.Client, account *app.Account, now time.Time, threshold float64, thresholdAction, shutdownMode string, keepAlive, monthlyAutoStart bool) {
+	shutdownMode = app.ResolveShutdownMode(account.StoppedMode, shutdownMode)
+	rotationManaged := w.rotationManaged(account.ID)
 	protectionTraffic, protectionSource, available := w.protectionTrafficStatus(ctx, client, *account, account.TrafficUsed, account.TrafficAPIStatus != "error" && !account.ProtectionSuspended)
 	if !available {
 		account.ProtectionSuspended = true
@@ -313,15 +360,19 @@ func (w *Worker) runCachedAutomation(ctx context.Context, client cloud.Client, a
 			account.ProtectionNotifiedAt = now.Unix()
 		}
 	} else if !account.ScheduleBlockedByTraffic {
-		w.runSchedule(ctx, client, account, now, shutdownMode)
-		if monthlyAutoStart && now.Day() == 1 && account.InstanceStatus == "Stopped" && !account.AutoStartBlocked && !scheduledStopBlocksAutomaticStart(*account) && !sameMonth(account.LastKeepAliveAt, now) {
+		if rotationManaged {
+			w.runRotationSchedule(ctx, client, account, now, shutdownMode)
+		} else {
+			w.runSchedule(ctx, client, account, now, shutdownMode)
+		}
+		if !rotationManaged && monthlyAutoStart && now.Day() == 1 && account.InstanceStatus == "Stopped" && !account.AutoStartBlocked && !scheduledStopBlocksAutomaticStart(*account) && !sameMonth(account.LastKeepAliveAt, now) {
 			if err := client.StartInstance(ctx, account.RegionID, account.InstanceID); err == nil {
 				account.InstanceStatus = "Starting"
 				account.LastKeepAliveAt = now.Unix()
 				w.dispatchEvent(ctx, statusEvent(*account, "Stopped", "Starting", "每月 1 号自动开机。"))
 			}
 		}
-		if keepAlive && account.InstanceStatus == "Stopped" && canKeepAlive(*account, requiresProtection) {
+		if !rotationManaged && keepAlive && account.InstanceStatus == "Stopped" && canKeepAlive(*account, requiresProtection) {
 			if err := client.StartInstance(ctx, account.RegionID, account.InstanceID); err == nil {
 				account.InstanceStatus = "Starting"
 				account.LastKeepAliveAt = now.Unix()
@@ -337,6 +388,8 @@ func (w *Worker) runCachedAutomation(ctx context.Context, client cloud.Client, a
 // applyTrafficProtection runs the same threshold and auto-start decisions
 // after a fresh CMS sample or after CMS failed and CDT supplied the fallback.
 func (w *Worker) applyTrafficProtection(ctx context.Context, client cloud.Client, account *app.Account, now time.Time, threshold float64, thresholdAction, shutdownMode string, cmsTraffic float64, cmsAvailable, keepAlive, monthlyAutoStart bool) bool {
+	shutdownMode = app.ResolveShutdownMode(account.StoppedMode, shutdownMode)
+	rotationManaged := w.rotationManaged(account.ID)
 	protectionTraffic, protectionSource, available := w.protectionTrafficStatus(ctx, client, *account, cmsTraffic, cmsAvailable)
 	if !available {
 		account.ProtectionSuspended = true
@@ -373,8 +426,12 @@ func (w *Worker) applyTrafficProtection(ctx context.Context, client cloud.Client
 		account.ProtectionNotifiedAt = now.Unix()
 	}
 	if cmsAvailable && !requiresProtection && !account.ScheduleBlockedByTraffic {
-		w.runSchedule(ctx, client, account, now, shutdownMode)
-		if monthlyAutoStart && now.Day() == 1 && account.InstanceStatus == "Stopped" && !account.AutoStartBlocked && !scheduledStopBlocksAutomaticStart(*account) && !sameMonth(account.LastKeepAliveAt, now) {
+		if rotationManaged {
+			w.runRotationSchedule(ctx, client, account, now, shutdownMode)
+		} else {
+			w.runSchedule(ctx, client, account, now, shutdownMode)
+		}
+		if !rotationManaged && monthlyAutoStart && now.Day() == 1 && account.InstanceStatus == "Stopped" && !account.AutoStartBlocked && !scheduledStopBlocksAutomaticStart(*account) && !sameMonth(account.LastKeepAliveAt, now) {
 			if err := client.StartInstance(ctx, account.RegionID, account.InstanceID); err == nil {
 				account.InstanceStatus = "Starting"
 				account.LastKeepAliveAt = now.Unix()
@@ -383,7 +440,7 @@ func (w *Worker) applyTrafficProtection(ctx context.Context, client cloud.Client
 				w.Store.AddLog("error", "月初自动开机失败: "+err.Error())
 			}
 		}
-		if keepAlive && account.InstanceStatus == "Stopped" && canKeepAlive(*account, requiresProtection) {
+		if !rotationManaged && keepAlive && account.InstanceStatus == "Stopped" && canKeepAlive(*account, requiresProtection) {
 			if err := client.StartInstance(ctx, account.RegionID, account.InstanceID); err == nil {
 				account.InstanceStatus = "Starting"
 				account.LastKeepAliveAt = now.Unix()
@@ -432,6 +489,7 @@ func (w *Worker) refreshTraffic(ctx context.Context, client cloud.Client, accoun
 }
 
 func (w *Worker) runSchedule(ctx context.Context, client cloud.Client, account *app.Account, now time.Time, shutdownMode string) {
+	shutdownMode = app.ResolveShutdownMode(account.StoppedMode, shutdownMode)
 	if !account.ScheduleEnabled {
 		return
 	}
@@ -533,6 +591,15 @@ func (w *Worker) Run(ctx context.Context) {
 		if err := w.execute(ctx, job); err != nil {
 			w.Log.Printf("job %s: %v", job.JobID, err)
 			maxAttempts := 5
+			if job.Kind == "create_ecs" {
+				message := strings.ToLower(err.Error())
+				for _, code := range []string{"quotaexceeded.vpc", "idempotentparametermismatch", "invalidaccountstatus.notenoughbalance", "invalidcidrblock.overlapped", "invalidparameter.instancetypenotsupport", "insufficientstock", "not_enough_stock"} {
+					if strings.Contains(message, code) {
+						maxAttempts = 1
+						break
+					}
+				}
+			}
 			if job.Kind == "delete_instance" {
 				maxAttempts = 20
 			}
@@ -541,7 +608,7 @@ func (w *Worker) Run(ctx context.Context) {
 			} else {
 				if job.Kind == "delete_instance" {
 					if id, parseErr := strconv.ParseInt(job.EntityKey, 10, 64); parseErr == nil {
-						_ = w.Store.SetInstanceStatus(id, "ReleaseFailed")
+						_ = w.Store.MarkReleaseFailed(id)
 					}
 				}
 				_ = w.Store.FailJob(job.JobID, err.Error())
@@ -558,28 +625,9 @@ func (w *Worker) execute(ctx context.Context, job *store.Job) error {
 		return w.createECS(ctx, job)
 	case "delete_instance":
 		return w.deleteInstance(ctx, job)
-	case "delete_ddns":
-		return w.deleteDDNSJob(ctx, job)
 	default:
 		return fmt.Errorf("unknown job kind %q", job.Kind)
 	}
-}
-
-func (w *Worker) deleteDDNSJob(ctx context.Context, job *store.Job) error {
-	var payload struct {
-		Account app.Account   `json:"account"`
-		Before  []app.Account `json:"before"`
-	}
-	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
-		return err
-	}
-	if payload.Account.InstanceID == "" {
-		return fmt.Errorf("DDNS cleanup payload has no instance")
-	}
-	if len(payload.Before) == 0 {
-		payload.Before = []app.Account{payload.Account}
-	}
-	return w.deleteDDNSAccount(ctx, payload.Account, payload.Before)
 }
 
 func (w *Worker) deleteInstance(ctx context.Context, job *store.Job) error {
@@ -587,21 +635,14 @@ func (w *Worker) deleteInstance(ctx context.Context, job *store.Job) error {
 	if err != nil {
 		return err
 	}
-	account, err := w.Store.Account(id, false)
+	account, err := w.Store.Account(id, true)
 	if err != nil {
 		return err
 	}
-	client := w.Cloud
-	if w.CloudFactory != nil {
-		client = w.CloudFactory(app.AccountGroup{AccessKeyID: account.AccessKeyID, AccessKeySecret: account.AccessKeySecret, RegionID: account.RegionID, SiteType: account.SiteType})
-	}
+	client := w.cloudClient(app.AccountGroup{AccessKeyID: account.AccessKeyID, AccessKeySecret: account.AccessKeySecret, RegionID: account.RegionID, SiteType: account.SiteType})
 	if client == nil {
 		return fmt.Errorf("cloud client is not configured")
 	}
-	// Capture the pre-delete group membership. Multi-instance DDNS names use
-	// the group count, so recomputing after the row is marked deleted would
-	// derive a different record name and leave the old record behind.
-	beforeAccounts, _ := w.Store.LoadAccounts(false)
 	status := account.InstanceStatus
 	notFound := false
 	if status != "Stopped" && status != "Released" {
@@ -618,7 +659,7 @@ func (w *Worker) deleteInstance(ctx context.Context, job *store.Job) error {
 	}
 	if !notFound && status != "Stopped" && status != "Released" {
 		if status != "Stopping" {
-			if err := client.StopInstance(ctx, account.RegionID, account.InstanceID, w.Store.GetSetting("shutdown_mode", "KeepCharging")); err != nil {
+			if err := client.StopInstance(ctx, account.RegionID, account.InstanceID, app.ResolveShutdownMode(account.StoppedMode, w.Store.GetSetting("shutdown_mode", "KeepCharging"))); err != nil {
 				return err
 			}
 			_ = w.Store.SetInstanceStatus(id, "Stopping")
@@ -638,26 +679,19 @@ func (w *Worker) deleteInstance(ctx context.Context, job *store.Job) error {
 			return err
 		}
 	}
-	// Keep the local row in Releasing until the external DNS record is also
-	// gone, so a transient Cloudflare failure remains retryable.
-	if err := w.deleteDDNSAccount(ctx, *account, beforeAccounts); err != nil {
-		return err
+	if err := w.Store.RemoveRotationMember(id); err != nil {
+		return fmt.Errorf("移除实例分组关系失败: %w", err)
 	}
 	if err := w.Store.PhysicallyDelete(id); err != nil {
 		return err
 	}
-	before := beforeAccounts
-	if len(before) == 0 {
-		before = []app.Account{*account}
-	}
-	w.syncAllDDNS(ctx)
-	w.dispatchEvent(ctx, notify.Event{Title: "实例已释放", Summary: "实例已从云端释放，本地记录和 DDNS 已清理。", AccountID: accountLabel(*account), Text: fmt.Sprintf("【ECS 控制台】实例已释放\n实例: %s\n实例 ID: %s\n区域: %s\n公网 IP: %s\n时间: %s", accountLabel(*account), account.InstanceID, account.RegionID, account.PublicIP, time.Now().Format("2006-01-02 15:04:05")), Fields: map[string]string{"instance_id": account.InstanceID, "region": account.RegionID, "public_ip": account.PublicIP}})
+	w.dispatchEvent(ctx, notify.Event{Title: "实例已释放", Summary: "实例已从云端释放，本地记录已清理。", AccountID: accountLabel(*account), Text: fmt.Sprintf("【ECS 控制台】ECS 已释放\n实例: %s\n实例 ID: %s\n区域: %s\n公网 IP: %s\n时间: %s", accountLabel(*account), account.InstanceID, account.RegionID, account.PublicIP, time.Now().Format("2006-01-02 15:04:05")), Fields: map[string]string{"instance_id": account.InstanceID, "region": account.RegionID, "public_ip": account.PublicIP}})
 	w.Store.AddLog("info", "实例已异步释放: "+account.InstanceID)
 	return nil
 }
 
 func (w *Worker) createECS(ctx context.Context, job *store.Job) (err error) {
-	if w.Cloud == nil && w.CloudFactory == nil {
+	if w.CloudFactory == nil {
 		return fmt.Errorf("cloud client is not configured")
 	}
 	task, err := w.Store.GetTaskForWorker(job.EntityKey)
@@ -682,52 +716,41 @@ func (w *Worker) createECS(ctx context.Context, job *store.Job) (err error) {
 	if group == nil {
 		return fmt.Errorf("account group %s not found", task.GroupKey)
 	}
-	client := w.Cloud
-	if w.CloudFactory != nil {
-		client = w.CloudFactory(*group)
-	}
+	client := w.cloudClient(*group)
 	if client == nil {
 		return fmt.Errorf("cloud client is not configured")
 	}
 	zoneID := stringOr(payload, "zoneId", "")
 	if zoneID == "" || zoneID == "待由云 API 选择" {
-		zones, zoneErr := client.DescribeZones(ctx, task.RegionID)
-		if zoneErr != nil || len(zones) == 0 {
-			if zoneErr != nil {
-				return fmt.Errorf("选择可用区失败: %w", zoneErr)
-			}
-			return fmt.Errorf("区域没有可用区")
-		}
-		zoneID = stringOr(zones[0], "ZoneId", stringOr(zones[0], "zoneId", ""))
-		if zoneID == "" {
-			return fmt.Errorf("云 API 未返回可用区")
-		}
-		payload["zoneId"] = zoneID
-		_ = w.Store.UpdateTask(task.TaskID, map[string]any{"zone_id": zoneID})
+		return fmt.Errorf("创建任务未指定可用区，请重新预览并选择可用区")
 	}
 
-	var createdInstance, allocationID string
+	var createdInstance string
 	var createdVPC, createdVSwitch, createdSecurityGroup string
 	networkCreated := false
 	defer func() {
 		if err == nil {
 			return
 		}
+		if createdInstance != "" {
+			_ = w.Store.UpdateTask(task.TaskID, map[string]any{
+				"status":         "partial",
+				"step":           "实例已创建，后续配置失败",
+				"error_message":  err.Error(),
+				"instance_id":    createdInstance,
+				"login_user":     stringOr(payload, "loginUser", "root"),
+				"login_password": stringOr(payload, "loginPassword", task.LoginPassword),
+			})
+			w.Store.AddLog("warning", "ECS 已创建但后续配置失败，实例已保留: "+createdInstance+" / "+err.Error())
+			err = nil
+			return
+		}
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		// Every resource created by this task is tracked locally before moving on
-		// to the next step, so retries can compensate known partial state.
-		if allocationID != "" {
-			_ = client.UnassociateEIP(rollbackCtx, task.RegionID, allocationID)
-			_ = client.ReleaseEIP(rollbackCtx, task.RegionID, allocationID)
-		}
-		if createdInstance != "" {
-			_ = client.DeleteInstance(rollbackCtx, task.RegionID, createdInstance)
-		}
 		if networkCreated {
 			_ = client.CleanupNetwork(rollbackCtx, task.RegionID, createdVPC, createdVSwitch, createdSecurityGroup)
 		}
-		_ = w.Store.UpdateTask(task.TaskID, map[string]any{"status": "failed", "step": "已回滚云资源", "error_message": err.Error(), "instance_id": createdInstance, "eip_allocation_id": allocationID})
+		_ = w.Store.UpdateTask(task.TaskID, map[string]any{"status": "failed", "step": "创建失败", "error_message": err.Error()})
 	}()
 
 	_ = w.Store.UpdateTask(task.TaskID, map[string]any{"status": "running", "step": "准备网络"})
@@ -736,16 +759,34 @@ func (w *Worker) createECS(ctx context.Context, job *store.Job) (err error) {
 	securityGroupID := stringOr(payload, "securityGroupId", "")
 	if vpcID == "" || vswitchID == "" || securityGroupID == "" {
 		loginPort := intField(payload, "loginPort")
+		osKey := stringOr(payload, "osKey", "")
 		if loginPort == 0 {
-			loginPort = loginPortForOS(stringOr(payload, "osKey", ""))
+			loginPort = loginPortForOS(osKey)
 		}
-		if networkClient, ok := client.(cloud.NetworkClient); ok {
-			vpcID, vswitchID, securityGroupID, err = networkClient.PrepareNetworkForPort(ctx, task.RegionID, stringOr(payload, "cidr", "192.168.0.0/16"), zoneID, stringOr(payload, "clientCidrIp", "127.0.0.1/32"), loginPort)
+		securityGroupPort := loginPort
+		if !strings.HasPrefix(strings.ToLower(osKey), "windows") {
+			securityGroupPort = cloud.AllInboundPorts
+		}
+		if reusableClient, ok := client.(cloud.ReusableNetworkClient); ok {
+			prepared, prepareErr := reusableClient.PrepareReusableNetworkForPort(ctx, task.RegionID, stringOr(payload, "cidr", "192.168.0.0/16"), zoneID, stringOr(payload, "clientCidrIp", "127.0.0.1/32"), securityGroupPort)
+			vpcID, vswitchID, securityGroupID, err = prepared.VPCID, prepared.VSwitchID, prepared.SecurityGroupID, prepareErr
+			if prepared.CreatedVPC {
+				createdVPC = prepared.VPCID
+			}
+			if prepared.CreatedVSwitch {
+				createdVSwitch = prepared.VSwitchID
+			}
+			if prepared.CreatedSG {
+				createdSecurityGroup = prepared.SecurityGroupID
+			}
+		} else if networkClient, ok := client.(cloud.NetworkClient); ok {
+			vpcID, vswitchID, securityGroupID, err = networkClient.PrepareNetworkForPort(ctx, task.RegionID, stringOr(payload, "cidr", "192.168.0.0/16"), zoneID, stringOr(payload, "clientCidrIp", "127.0.0.1/32"), securityGroupPort)
+			createdVPC, createdVSwitch, createdSecurityGroup = vpcID, vswitchID, securityGroupID
 		} else {
 			vpcID, vswitchID, securityGroupID, err = client.PrepareNetwork(ctx, task.RegionID, stringOr(payload, "cidr", "192.168.0.0/16"), zoneID, stringOr(payload, "clientCidrIp", "127.0.0.1/32"))
+			createdVPC, createdVSwitch, createdSecurityGroup = vpcID, vswitchID, securityGroupID
 		}
-		createdVPC, createdVSwitch, createdSecurityGroup = vpcID, vswitchID, securityGroupID
-		networkCreated = true
+		networkCreated = createdVPC != "" || createdVSwitch != "" || createdSecurityGroup != ""
 		if err != nil {
 			return err
 		}
@@ -757,43 +798,26 @@ func (w *Worker) createECS(ctx context.Context, job *store.Job) (err error) {
 	if stringOr(payload, "imageId", "") == "" {
 		return fmt.Errorf("预检未返回有效镜像 ID")
 	}
-	run, err := client.RunInstances(ctx, cloud.RunRequest{RegionID: task.RegionID, ZoneID: zoneID, InstanceType: task.InstanceType, ImageID: stringOr(payload, "imageId", ""), InstanceName: stringOr(payload, "instanceName", "ecs-controller"), VPCID: vpcID, VSwitchID: vswitchID, SecurityGroupID: securityGroupID, Bandwidth: intField(payload, "internetMaxBandwidthOut"), DiskSize: intField(payload, "systemDiskSize"), DiskCategory: stringOr(payload, "systemDiskCategory", "cloud_essd"), PublicIPMode: stringOr(payload, "publicIpMode", "ecs_public_ip"), Password: password, LoginPort: intField(payload, "loginPort"), ClientToken: task.TaskID})
+	run, err := client.RunInstances(ctx, cloud.RunRequest{RegionID: task.RegionID, ZoneID: zoneID, InstanceType: task.InstanceType, ImageID: stringOr(payload, "imageId", ""), InstanceName: stringOr(payload, "instanceName", "ecs-controller"), VPCID: vpcID, VSwitchID: vswitchID, SecurityGroupID: securityGroupID, Bandwidth: intField(payload, "internetMaxBandwidthOut"), DiskSize: intField(payload, "systemDiskSize"), DiskCategory: stringOr(payload, "systemDiskCategory", "cloud_essd"), PublicIPMode: stringOr(payload, "publicIpMode", "ecs_public_ip"), BillingMode: stringOr(payload, "billingMode", cloud.BillingModePostpaid), Password: password, LoginPort: intField(payload, "loginPort"), ClientToken: task.TaskID, UserData: stringOr(payload, "cloudInitUserData", "")})
 	if err != nil {
 		return err
 	}
 	createdInstance = run.InstanceID
 	if createdInstance == "" {
-		return fmt.Errorf("RunInstances returned no instance id")
+		return fmt.Errorf("阿里云未返回实例 ID；抢占式库存可能已售罄，请更换可用区、实例规格或改用普通按量后重试")
 	}
 	_ = w.Store.UpdateTask(task.TaskID, map[string]any{"instance_id": createdInstance, "public_ip": run.PublicIP, "login_user": stringOr(payload, "loginUser", "root"), "login_password": password, "step": "等待实例网络就绪"})
 
 	publicIP := run.PublicIP
-	if stringOr(payload, "publicIpMode", "ecs_public_ip") == "eip" {
-		allocationID, publicIP, err = allocateEIP(ctx, client, task.RegionID, intField(payload, "internetMaxBandwidthOut"))
-		if err != nil {
-			return err
-		}
-		if err = client.AssociateEIP(ctx, task.RegionID, allocationID, createdInstance); err != nil {
-			return err
-		}
-		_ = w.Store.UpdateTask(task.TaskID, map[string]any{"eip_allocation_id": allocationID, "eip_address": publicIP, "eip_managed": true, "public_ip": publicIP})
-	}
 
-	a := app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, InstanceID: createdInstance, MaxTraffic: group.MaxTraffic, ScheduleEnabled: group.ScheduleEnabled, ScheduleStartEnabled: group.ScheduleStartEnabled, ScheduleStopEnabled: group.ScheduleStopEnabled, StartTime: group.StartTime, StopTime: group.StopTime, Remark: group.Remark, SiteType: group.SiteType, GroupKey: group.GroupKey, InstanceName: stringOr(payload, "instanceName", ""), InstanceType: task.InstanceType, InternetBandwidth: intField(payload, "internetMaxBandwidthOut"), PublicIP: publicIP, PublicIPMode: stringOr(payload, "publicIpMode", "ecs_public_ip"), EIPAllocationID: allocationID, EIPAddress: publicIP, EIPManaged: allocationID != "", InstanceStatus: "Running", UpdatedAt: time.Now().Unix()}
+	scheduleEnabled := boolField(payload, "scheduleEnabled")
+	a := app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, InstanceID: createdInstance, MaxTraffic: group.MaxTraffic, ScheduleEnabled: scheduleEnabled, ScheduleStartEnabled: scheduleEnabled, ScheduleStopEnabled: scheduleEnabled, StartTime: stringOr(payload, "startTime", ""), StopTime: stringOr(payload, "stopTime", ""), StoppedMode: app.ResolveShutdownMode(stringOr(payload, "stoppedMode", ""), w.Store.GetSetting("shutdown_mode", "KeepCharging")), Remark: group.Remark, SiteType: group.SiteType, GroupKey: group.GroupKey, InstanceName: stringOr(payload, "instanceName", ""), InstanceType: task.InstanceType, InternetBandwidth: intField(payload, "internetMaxBandwidthOut"), PublicIP: publicIP, PublicIPMode: stringOr(payload, "publicIpMode", "ecs_public_ip"), InstanceStatus: "Running", UpdatedAt: time.Now().Unix()}
 	if err = w.Store.UpsertAccount(a); err != nil {
 		return err
 	}
-	w.syncDDNSAccount(ctx, a)
-	_ = w.Store.UpdateTask(task.TaskID, map[string]any{"status": "success", "step": "创建完成", "public_ip": publicIP, "login_user": stringOr(payload, "loginUser", "root"), "login_password": password, "error_message": ""})
+	_ = w.Store.UpdateTask(task.TaskID, map[string]any{"status": "success", "step": "创建完成", "public_ip": publicIP, "login_user": stringOr(payload, "loginUser", "root"), "login_password": password, "error_message": "", "public_ip_mode": stringOr(payload, "publicIpMode", "ecs_public_ip")})
 	w.dispatchEvent(ctx, notify.Event{Title: "ECS 创建成功", Summary: "实例已创建并启动，请保存一次性登录密码。", AccountID: group.Remark, Text: fmt.Sprintf("【ECS 控制台】ECS 创建成功\n账号: %s\n实例 ID: %s\n区域: %s\n规格: %s\n公网 IP: %s\n登录用户: %s\n初始密码: %s\n请立即保存并修改初始密码。", group.Remark, createdInstance, task.RegionID, task.InstanceType, publicIP, stringOr(payload, "loginUser", "root"), password), Fields: map[string]string{"instance_id": createdInstance, "region": task.RegionID, "public_ip": publicIP, "password": password}})
 	return nil
-}
-
-func allocateEIP(ctx context.Context, client cloud.Client, region string, bandwidth int) (string, string, error) {
-	if bandwidthClient, ok := client.(cloud.BandwidthEIPClient); ok {
-		return bandwidthClient.AllocateEIPWithBandwidth(ctx, region, bandwidth)
-	}
-	return client.AllocateEIP(ctx, region)
 }
 
 func retryDelay(attempt int) time.Duration {
@@ -843,6 +867,21 @@ func intField(m map[string]any, key string) int {
 		return n
 	}
 	return 0
+}
+
+func boolField(m map[string]any, key string) bool {
+	switch value := m[key].(type) {
+	case bool:
+		return value
+	case float64:
+		return value != 0
+	case int:
+		return value != 0
+	case string:
+		return value == "1" || strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+	default:
+		return false
+	}
 }
 
 func loginPortForOS(osKey string) int {

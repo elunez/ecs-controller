@@ -11,22 +11,27 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/Kori1c/ecs-controller/internal/app"
 )
 
-const (
-	defaultUpdateRepo   = "Kori1c/ecs-controller"
-	defaultUpdateBranch = "main"
-	defaultImageRepo    = "docker.io/kori1c/ecs-controller"
-)
+const defaultUpdateRepo = "elunez/ecs-controller"
 
 var commitPattern = regexp.MustCompile(`^[a-fA-F0-9]{40}$`)
 var versionTagPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
 
-type updateCheckResult struct {
+type githubRelease struct {
+	TagName string `json:"tag_name"`
+	HTMLURL string `json:"html_url"`
+	Assets  []struct {
+		Name string `json:"name"`
+	} `json:"assets"`
+}
+
+type githubCommit struct {
 	SHA    string `json:"sha"`
 	Commit struct {
 		Message string `json:"message"`
@@ -34,25 +39,15 @@ type updateCheckResult struct {
 	HTMLURL string `json:"html_url"`
 }
 
-type updateVersionTag struct {
-	Name   string `json:"name"`
-	Commit struct {
-		SHA string `json:"sha"`
-	} `json:"commit"`
-}
-
 type updateRequest struct {
-	RequestID   string `json:"request_id"`
-	TargetSHA   string `json:"target_sha"`
-	RequestedAt int64  `json:"requested_at"`
+	RequestID     string `json:"request_id"`
+	TargetSHA     string `json:"target_sha"`
+	TargetVersion string `json:"target_version"`
+	RequestedAt   int64  `json:"requested_at"`
 }
 
 func (s *Server) updateRepository() string {
 	return fallback(os.Getenv("ECS_UPDATE_REPO"), defaultUpdateRepo)
-}
-
-func (s *Server) updateBranch() string {
-	return fallback(os.Getenv("ECS_UPDATE_BRANCH"), defaultUpdateBranch)
 }
 
 func (s *Server) updateRepositoryURL() string {
@@ -66,195 +61,162 @@ func (s *Server) updateAPIURL() string {
 	return "https://api.github.com"
 }
 
-func (s *Server) updateImageRepository() string {
-	return fallback(os.Getenv("ECS_IMAGE_REPOSITORY"), defaultImageRepo)
-}
-
-func imageTag(commit string) string {
-	return "sha-" + strings.ToLower(strings.TrimSpace(commit))
-}
-
 func (s *Server) updateConfigured() bool {
 	return strings.TrimSpace(s.UpdateDir) != ""
 }
 
-func (s *Server) checkForUpdate(w http.ResponseWriter, r *http.Request) {
-	currentCommit := strings.TrimSpace(app.Commit)
-	currentVersion := shortCommit(currentCommit)
-	if currentVersion == "" || currentVersion == "dev" {
-		currentVersion = app.Version
+func releaseAssetName(goos, goarch string) string {
+	if goarch != "amd64" && goarch != "arm64" {
+		return ""
 	}
-	result := map[string]any{
-		"success":           true,
-		"configured":        s.updateConfigured(),
-		"repository":        s.updateRepository(),
-		"repository_url":    s.updateRepositoryURL(),
-		"image_repository":  s.updateImageRepository(),
-		"branch":            s.updateBranch(),
-		"current_version":   currentVersion,
-		"current_commit":    currentCommit,
-		"current_url":       "",
-		"current_image_tag": "",
-		"build_date":        app.BuildDate,
-		"update_available":  false,
-		"checked_at":        time.Now().UTC().Format(time.RFC3339),
+	switch goos {
+	case "linux":
+		return "ecs-controller-linux-" + goarch + ".tar.gz"
+	case "windows":
+		return "ecs-controller-windows-" + goarch + ".zip"
+	default:
+		return ""
 	}
-	if commitPattern.MatchString(currentCommit) {
-		result["current_url"] = s.updateRepositoryURL() + "/commit/" + currentCommit
-		result["current_image_tag"] = imageTag(currentCommit)
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-	defer cancel()
-	endpoint := fmt.Sprintf("%s/repos/%s/commits/%s", s.updateAPIURL(), s.updateRepository(), s.updateBranch())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		s.error(w, http.StatusBadGateway, "更新检查请求创建失败")
-		return
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "ecs-controller-update-check")
-	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
-	if err != nil {
-		result["success"] = false
-		result["message"] = "无法连接 GitHub，请检查容器网络"
-		s.json(w, http.StatusOK, result)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		result["success"] = false
-		result["message"] = fmt.Sprintf("GitHub 返回 HTTP %d", resp.StatusCode)
-		s.json(w, http.StatusOK, result)
-		return
-	}
-	var latest updateCheckResult
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&latest); err != nil || !commitPattern.MatchString(latest.SHA) {
-		result["success"] = false
-		result["message"] = "GitHub 返回的版本信息无效"
-		s.json(w, http.StatusOK, result)
-		return
-	}
-	versionTags := s.versionTags(ctx)
-	if version := versionTags[strings.ToLower(currentCommit)]; version != "" {
-		result["current_version"] = version
-	}
-	latestVersion := fallback(versionTags[strings.ToLower(latest.SHA)], shortCommit(latest.SHA))
-	result["latest"] = map[string]any{
-		"version": latestVersion,
-		"commit":  latest.SHA,
-		"message": strings.TrimSpace(strings.Split(latest.Commit.Message, "\n")[0]),
-		"url":     latest.HTMLURL,
-	}
-	sourceUpdateAvailable := !strings.EqualFold(currentCommit, latest.SHA) && !strings.EqualFold(currentCommit, shortCommit(latest.SHA))
-	result["source_update_available"] = sourceUpdateAvailable
-	result["image_tag"] = imageTag(latest.SHA)
-	imageAvailable, imageDigest, imageErr := s.prebuiltImageAvailable(ctx, latest.SHA)
-	result["image_available"] = imageAvailable
-	if imageDigest != "" {
-		result["image_digest"] = imageDigest
-	}
-	if imageErr != nil {
-		result["image_check_error"] = imageErr.Error()
-	}
-	result["update_available"] = sourceUpdateAvailable && imageAvailable
-	if sourceUpdateAvailable && !imageAvailable {
-		if imageErr != nil {
-			result["message"] = "检测到源码更新，但无法确认对应的预构建 Docker 镜像，请稍后重试"
-		} else {
-			result["message"] = "检测到源码更新，Docker 镜像正在构建中····，请稍等片刻～"
-		}
-	}
-	if !s.updateConfigured() {
-		result["message"] = "当前部署未启用 Docker 在线更新，请使用 install.sh 更新"
-	}
-	s.json(w, http.StatusOK, result)
 }
 
-func (s *Server) versionTags(ctx context.Context) map[string]string {
-	endpoint := fmt.Sprintf("%s/repos/%s/tags?per_page=100", s.updateAPIURL(), s.updateRepository())
+func releaseHasAssets(release githubRelease, assetName string) bool {
+	if assetName == "" {
+		return false
+	}
+	foundPackage, foundChecksums := false, false
+	for _, asset := range release.Assets {
+		switch asset.Name {
+		case assetName:
+			foundPackage = true
+		case "checksums.txt":
+			foundChecksums = true
+		}
+	}
+	return foundPackage && foundChecksums
+}
+
+func (s *Server) releasePackageAvailable(release githubRelease, assetName string) bool {
+	if s.packageChecker != nil {
+		return s.packageChecker(release, assetName)
+	}
+	return releaseHasAssets(release, assetName)
+}
+
+func (s *Server) githubJSON(ctx context.Context, endpoint string, target any) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil
+		return err
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("User-Agent", "ecs-controller-update-check")
 	response, err := (&http.Client{Timeout: 8 * time.Second}).Do(request)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil
+		return fmt.Errorf("GitHub 返回 HTTP %d", response.StatusCode)
 	}
-	var tags []updateVersionTag
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&tags); err != nil {
-		return nil
+	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(target); err != nil {
+		return fmt.Errorf("GitHub 返回的数据无效: %w", err)
 	}
-	return versionTagsForCommits(tags)
+	return nil
 }
 
-func versionTagsForCommits(tags []updateVersionTag) map[string]string {
-	versions := make(map[string]string, len(tags))
-	for _, tag := range tags {
-		commit := strings.ToLower(strings.TrimSpace(tag.Commit.SHA))
-		if !commitPattern.MatchString(commit) || !versionTagPattern.MatchString(tag.Name) {
-			continue
-		}
-		if _, exists := versions[commit]; !exists {
-			versions[commit] = tag.Name
-		}
+func (s *Server) latestRelease(ctx context.Context) (githubRelease, githubCommit, error) {
+	var release githubRelease
+	endpoint := fmt.Sprintf("%s/repos/%s/releases/latest", s.updateAPIURL(), s.updateRepository())
+	if err := s.githubJSON(ctx, endpoint, &release); err != nil {
+		return githubRelease{}, githubCommit{}, err
 	}
-	return versions
+	return s.resolveReleaseCommit(ctx, release)
 }
 
-func (s *Server) prebuiltImageAvailable(ctx context.Context, commit string) (bool, string, error) {
-	if s.imageChecker != nil {
-		return s.imageChecker(ctx, commit)
+func (s *Server) releaseForVersion(ctx context.Context, version string) (githubRelease, githubCommit, error) {
+	var release githubRelease
+	endpoint := fmt.Sprintf("%s/repos/%s/releases/tags/%s", s.updateAPIURL(), s.updateRepository(), url.PathEscape(version))
+	if err := s.githubJSON(ctx, endpoint, &release); err != nil {
+		return githubRelease{}, githubCommit{}, err
 	}
-	repository := strings.TrimSpace(s.updateImageRepository())
-	repository = strings.TrimPrefix(repository, "https://")
-	repository = strings.TrimPrefix(repository, "http://")
-	registry, path := "docker.io", repository
-	if strings.HasPrefix(path, "docker.io/") {
-		path = strings.TrimPrefix(path, "docker.io/")
-	} else if slash := strings.IndexByte(path, '/'); slash > 0 && strings.Contains(path[:slash], ".") {
-		registry, path = path[:slash], path[slash+1:]
+	if release.TagName != version {
+		return githubRelease{}, githubCommit{}, errors.New("GitHub Release 版本不匹配")
 	}
-	tag := imageTag(commit)
-	var endpoint string
-	if registry == "docker.io" {
-		endpoint = "https://hub.docker.com/v2/repositories/" + path + "/tags/" + url.PathEscape(tag)
-	} else {
-		endpoint = "https://" + registry + "/v2/" + path + "/manifests/" + url.PathEscape(tag)
+	return s.resolveReleaseCommit(ctx, release)
+}
+
+func (s *Server) resolveReleaseCommit(ctx context.Context, release githubRelease) (githubRelease, githubCommit, error) {
+	if !versionTagPattern.MatchString(release.TagName) {
+		return githubRelease{}, githubCommit{}, errors.New("GitHub Release 版本无效")
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	var commit githubCommit
+	endpoint := fmt.Sprintf("%s/repos/%s/commits/%s", s.updateAPIURL(), s.updateRepository(), url.PathEscape(release.TagName))
+	if err := s.githubJSON(ctx, endpoint, &commit); err != nil {
+		return githubRelease{}, githubCommit{}, err
+	}
+	if !commitPattern.MatchString(commit.SHA) {
+		return githubRelease{}, githubCommit{}, errors.New("GitHub Release 提交版本无效")
+	}
+	return release, commit, nil
+}
+
+func (s *Server) checkForUpdate(w http.ResponseWriter, r *http.Request) {
+	currentCommit := strings.TrimSpace(app.Commit)
+	currentVersion := strings.TrimSpace(app.Version)
+	if currentVersion == "" || currentVersion == "dev" {
+		currentVersion = fallback(shortCommit(currentCommit), "dev")
+	}
+	assetName := releaseAssetName(runtime.GOOS, runtime.GOARCH)
+	result := map[string]any{
+		"success":                 true,
+		"configured":              s.updateConfigured(),
+		"repository":              s.updateRepository(),
+		"repository_url":          s.updateRepositoryURL(),
+		"current_version":         currentVersion,
+		"current_commit":          currentCommit,
+		"current_url":             "",
+		"build_date":              app.BuildDate,
+		"platform":                runtime.GOOS + "/" + runtime.GOARCH,
+		"package_name":            assetName,
+		"package_available":       false,
+		"source_update_available": false,
+		"update_available":        false,
+		"checked_at":              time.Now().UTC().Format(time.RFC3339),
+	}
+	if commitPattern.MatchString(currentCommit) {
+		result["current_url"] = s.updateRepositoryURL() + "/commit/" + currentCommit
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	release, latest, err := s.latestRelease(ctx)
 	if err != nil {
-		return false, "", err
+		result["success"] = false
+		result["message"] = "无法获取 GitHub Release：" + err.Error()
+		s.json(w, http.StatusOK, result)
+		return
 	}
-	request.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
-	request.Header.Set("User-Agent", "ecs-controller-image-check")
-	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
-	if err != nil {
-		return false, "", err
+	packageAvailable := s.releasePackageAvailable(release, assetName)
+	updateAvailable := !strings.EqualFold(currentCommit, latest.SHA)
+	result["latest"] = map[string]any{
+		"version": release.TagName,
+		"commit":  latest.SHA,
+		"message": strings.TrimSpace(strings.Split(latest.Commit.Message, "\n")[0]),
+		"url":     fallback(release.HTMLURL, latest.HTMLURL),
 	}
-	defer response.Body.Close()
-	if response.StatusCode == http.StatusNotFound {
-		return false, "", nil
+	result["package_available"] = packageAvailable
+	result["source_update_available"] = updateAvailable
+	result["update_available"] = updateAvailable && packageAvailable
+	if updateAvailable && !packageAvailable {
+		if assetName == "" {
+			result["message"] = "当前平台不支持后台在线更新"
+		} else {
+			result["message"] = "检测到新版本，但对应的发布包或校验文件尚未就绪"
+		}
 	}
-	if response.StatusCode != http.StatusOK {
-		return false, "", fmt.Errorf("镜像仓库返回 HTTP %d", response.StatusCode)
+	if !s.updateConfigured() {
+		result["message"] = "当前部署未启用后台在线更新，请重新运行 install.sh"
 	}
-	if digest := response.Header.Get("Docker-Content-Digest"); digest != "" {
-		return true, digest, nil
-	}
-	var tagInfo struct {
-		Digest string `json:"digest"`
-	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&tagInfo); err != nil && registry != "docker.io" {
-		return false, "", err
-	}
-	return true, tagInfo.Digest, nil
+	s.json(w, http.StatusOK, result)
 }
 
 func (s *Server) updateStatus(w http.ResponseWriter) {
@@ -265,7 +227,7 @@ func (s *Server) updateStatus(w http.ResponseWriter) {
 		"current_commit": currentCommit,
 	}
 	if !s.updateConfigured() {
-		status["message"] = "当前部署未启用 Docker 在线更新"
+		status["message"] = "当前部署未启用后台在线更新"
 		s.json(w, http.StatusOK, status)
 		return
 	}
@@ -277,9 +239,6 @@ func (s *Server) updateStatus(w http.ResponseWriter) {
 			for key, value := range stored {
 				status[key] = value
 			}
-			// The controller restarts before the updater writes its final status.
-			// If this process is already running the requested commit, the update
-			// has completed even when the status file is still in "restarting".
 			targetCommit := strings.TrimSpace(stringValue(stored["target_commit"]))
 			storedStatus := strings.TrimSpace(stringValue(stored["status"]))
 			if commitPattern.MatchString(currentCommit) && strings.EqualFold(targetCommit, currentCommit) && (storedStatus == "queued" || storedStatus == "running") {
@@ -300,11 +259,12 @@ func (s *Server) startUpdate(w http.ResponseWriter, r *http.Request, data map[st
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
 	if !s.updateConfigured() {
-		s.error(w, http.StatusServiceUnavailable, "当前部署未启用 Docker 在线更新，请使用 install.sh 更新")
+		s.error(w, http.StatusServiceUnavailable, "当前部署未启用后台在线更新，请重新运行 install.sh")
 		return
 	}
 	targetSHA := strings.ToLower(strings.TrimSpace(stringValue(data["target_commit"])))
-	if !commitPattern.MatchString(targetSHA) {
+	targetVersion := strings.TrimSpace(stringValue(data["target_version"]))
+	if !commitPattern.MatchString(targetSHA) || !versionTagPattern.MatchString(targetVersion) {
 		s.error(w, http.StatusBadRequest, "更新版本标识无效，请重新检查更新")
 		return
 	}
@@ -313,17 +273,23 @@ func (s *Server) startUpdate(w http.ResponseWriter, r *http.Request, data map[st
 		s.error(w, http.StatusConflict, "当前已经是目标版本")
 		return
 	}
-	checkContext, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+
+	checkContext, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
-	imageAvailable, _, imageErr := s.prebuiltImageAvailable(checkContext, targetSHA)
-	if imageErr != nil {
-		s.error(w, http.StatusServiceUnavailable, "无法确认目标版本的预构建 Docker 镜像，请稍后重试")
+	release, commit, err := s.releaseForVersion(checkContext, targetVersion)
+	if err != nil {
+		s.error(w, http.StatusServiceUnavailable, "无法确认目标 GitHub Release，请稍后重试")
 		return
 	}
-	if !imageAvailable {
-		s.error(w, http.StatusConflict, "目标版本的预构建 Docker 镜像尚未发布，请稍后重试")
+	if !strings.EqualFold(commit.SHA, targetSHA) {
+		s.error(w, http.StatusConflict, "GitHub Release 与目标提交不一致，请重新检查更新")
 		return
 	}
+	if !s.releasePackageAvailable(release, releaseAssetName(runtime.GOOS, runtime.GOARCH)) {
+		s.error(w, http.StatusConflict, "目标版本的发布包或校验文件尚未就绪")
+		return
+	}
+
 	state := s.readUpdateState()
 	if state == "queued" || state == "running" {
 		s.error(w, http.StatusConflict, "已有更新任务正在执行")
@@ -341,7 +307,12 @@ func (s *Server) startUpdate(w http.ResponseWriter, r *http.Request, data map[st
 		s.error(w, http.StatusInternalServerError, "更新目录不可用")
 		return
 	}
-	request := updateRequest{RequestID: randomToken(16), TargetSHA: targetSHA, RequestedAt: time.Now().Unix()}
+	request := updateRequest{
+		RequestID:     randomToken(16),
+		TargetSHA:     targetSHA,
+		TargetVersion: targetVersion,
+		RequestedAt:   time.Now().Unix(),
+	}
 	path := filepath.Join(s.UpdateDir, "request.json")
 	temporary := path + ".tmp"
 	raw, _ := json.Marshal(request)
@@ -354,7 +325,12 @@ func (s *Server) startUpdate(w http.ResponseWriter, r *http.Request, data map[st
 		s.error(w, http.StatusInternalServerError, "更新请求提交失败")
 		return
 	}
-	s.json(w, http.StatusAccepted, map[string]any{"success": true, "request_id": request.RequestID, "status": "queued"})
+	s.json(w, http.StatusAccepted, map[string]any{
+		"success":        true,
+		"request_id":     request.RequestID,
+		"status":         "queued",
+		"target_version": targetVersion,
+	})
 }
 
 func (s *Server) readUpdateState() string {

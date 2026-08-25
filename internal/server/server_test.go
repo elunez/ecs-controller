@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -41,7 +42,7 @@ func TestTemplateAndStaticAssetsUseCompressionAndCacheHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	handler := New(st, t.TempDir(), templatePath, "setup-token", nil).Handler()
+	handler := New(st, t.TempDir(), templatePath).Handler()
 	for _, test := range []struct {
 		path     string
 		cache    string
@@ -90,25 +91,19 @@ func TestTemplateAndStaticAssetsUseCompressionAndCacheHeaders(t *testing.T) {
 	}
 }
 
-func TestVersionTagsForCommitsUsesOnlySemanticReleaseTags(t *testing.T) {
-	firstCommit := strings.Repeat("a", 40)
-	secondCommit := strings.Repeat("b", 40)
-	invalidCommit := "not-a-commit"
-	firstTag := updateVersionTag{Name: "v1.6.40"}
-	firstTag.Commit.SHA = firstCommit
-	duplicateTag := updateVersionTag{Name: "v9.9.9"}
-	duplicateTag.Commit.SHA = firstCommit
-	nonVersionTag := updateVersionTag{Name: "latest"}
-	nonVersionTag.Commit.SHA = secondCommit
-	invalidTag := updateVersionTag{Name: "v1.6.41"}
-	invalidTag.Commit.SHA = invalidCommit
-
-	versions := versionTagsForCommits([]updateVersionTag{firstTag, duplicateTag, nonVersionTag, invalidTag})
-	if got := versions[firstCommit]; got != "v1.6.40" {
-		t.Fatalf("version=%q, want v1.6.40", got)
+func TestReleaseHasAssetsRequiresPackageAndChecksum(t *testing.T) {
+	var release githubRelease
+	release.Assets = append(release.Assets, struct {
+		Name string `json:"name"`
+	}{Name: "ecs-controller-linux-amd64.tar.gz"})
+	if releaseHasAssets(release, "ecs-controller-linux-amd64.tar.gz") {
+		t.Fatal("release without checksums.txt must not be installable")
 	}
-	if len(versions) != 1 {
-		t.Fatalf("unexpected version tags: %#v", versions)
+	release.Assets = append(release.Assets, struct {
+		Name string `json:"name"`
+	}{Name: "checksums.txt"})
+	if !releaseHasAssets(release, "ecs-controller-linux-amd64.tar.gz") {
+		t.Fatal("release package and checksums.txt should be installable")
 	}
 }
 
@@ -118,16 +113,20 @@ func TestCheckForUpdateUsesGitHubReleaseTagsAsDisplayVersions(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/repos/Kori1c/ecs-controller/commits/main":
+		case "/repos/elunez/ecs-controller/releases/latest":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v1.6.40",
+				"html_url": "https://github.com/elunez/ecs-controller/releases/tag/v1.6.40",
+				"assets": []map[string]any{
+					{"name": "ecs-controller-linux-amd64.tar.gz"},
+					{"name": "checksums.txt"},
+				},
+			})
+		case "/repos/elunez/ecs-controller/commits/v1.6.40":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"sha":      latestCommit,
 				"commit":   map[string]any{"message": "release build"},
-				"html_url": "https://github.com/Kori1c/ecs-controller/commit/" + latestCommit,
-			})
-		case "/repos/Kori1c/ecs-controller/tags":
-			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"name": "v1.6.40", "commit": map[string]any{"sha": latestCommit}},
-				{"name": "v1.6.39", "commit": map[string]any{"sha": currentCommit}},
+				"html_url": "https://github.com/elunez/ecs-controller/commit/" + latestCommit,
 			})
 		default:
 			http.NotFound(w, r)
@@ -140,14 +139,12 @@ func TestCheckForUpdateUsesGitHubReleaseTagsAsDisplayVersions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.githubAPIBase = api.URL
-	srv.imageChecker = func(context.Context, string) (bool, string, error) {
-		return true, "sha256:test", nil
-	}
+	srv.packageChecker = func(githubRelease, string) bool { return true }
 
 	previousCommit, previousVersion := app.Commit, app.Version
-	app.Commit, app.Version = currentCommit, "sha-"+shortCommit(currentCommit)
+	app.Commit, app.Version = currentCommit, "v1.6.39"
 	defer func() { app.Commit, app.Version = previousCommit, previousVersion }()
 
 	recorder := httptest.NewRecorder()
@@ -161,6 +158,9 @@ func TestCheckForUpdateUsesGitHubReleaseTagsAsDisplayVersions(t *testing.T) {
 	}
 	if got := result["current_version"]; got != "v1.6.39" {
 		t.Fatalf("current_version=%q, want v1.6.39", got)
+	}
+	if got := result["repository"]; got != "elunez/ecs-controller" {
+		t.Fatalf("repository=%q, want elunez/ecs-controller", got)
 	}
 	latest, ok := result["latest"].(map[string]any)
 	if !ok || latest["version"] != "v1.6.40" {
@@ -179,7 +179,7 @@ func TestSetupLoginAndCSRF(t *testing.T) {
 	if err := os.WriteFile(templatePath, []byte("<!doctype html>ok"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(st, dataDir, templatePath, "setup-token", nil)
+	srv := New(st, dataDir, templatePath)
 	httpSrv := httptest.NewServer(srv.Handler())
 	defer httpSrv.Close()
 	jar, _ := cookiejar.New(nil)
@@ -196,12 +196,24 @@ func TestSetupLoginAndCSRF(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	resp := postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_password": "correct horse battery staple", "traffic_threshold": 95}, map[string]string{"X-Setup-Token": "wrong"})
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("wrong setup token status: %d", resp.StatusCode)
+	resp := postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_password": "correct horse battery staple", "traffic_threshold": 95}, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("missing username status: %d body=%s", resp.StatusCode, body)
 	}
 	resp.Body.Close()
-	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_password": "correct horse battery staple", "traffic_threshold": 95}, map[string]string{"X-Setup-Token": "setup-token"})
+	if st.IsInitialized() {
+		t.Fatal("setup without username initialized the system")
+	}
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_username": "invalid username", "admin_password": "correct horse battery staple", "traffic_threshold": 95}, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("invalid username status: %d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_username": "admin.test", "admin_password": "correct horse battery staple", "traffic_threshold": 95}, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("setup status: %d", resp.StatusCode)
 	}
@@ -210,6 +222,13 @@ func TestSetupLoginAndCSRF(t *testing.T) {
 	if csrf == "" {
 		t.Fatal("setup did not return csrf token")
 	}
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_username": "other.admin", "admin_password": "another secure password"}, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("repeated setup status: %d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
 
 	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=save_config", map[string]any{"traffic_threshold": 90, "api_interval": 600}, nil)
 	if resp.StatusCode != http.StatusForbidden {
@@ -277,27 +296,81 @@ func TestSetupLoginAndCSRF(t *testing.T) {
 	}
 }
 
-func TestAdminPasswordCanBeChangedFromConfig(t *testing.T) {
+func TestPasswordLoginRequiresMatchingUsernameAndPassword(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SetAdminCredentials("admin.test", "secret1"); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := New(st, t.TempDir(), "")
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+	client := &http.Client{}
+
+	for _, credentials := range []map[string]any{
+		{"password": "secret1"},
+		{"username": "wrong.user", "password": "secret1"},
+		{"username": "admin.test", "password": "wrong1"},
+	} {
+		resp := postJSON(t, client, httpSrv.URL+"/index.php?action=login", credentials, nil)
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			t.Fatalf("invalid login status: %d body=%s", resp.StatusCode, body)
+		}
+		var result map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if result["success"] != false || result["message"] != "用户名或密码错误" {
+			t.Fatalf("unexpected invalid login response: %#v", result)
+		}
+	}
+
+	resp := postJSON(t, client, httpSrv.URL+"/index.php?action=login", map[string]any{"username": "admin.test", "password": "secret1"}, nil)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("valid login status: %d body=%s", resp.StatusCode, body)
+	}
+	var result map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if result["success"] != true {
+		t.Fatalf("valid login failed: %#v", result)
+	}
+}
+
+func TestAdminCredentialsCanBeChangedFromConfig(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	httpSrv := httptest.NewServer(srv.Handler())
 	defer httpSrv.Close()
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Jar: jar}
 
-	resp := postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_password": "start1"}, map[string]string{"X-Setup-Token": "setup-token"})
+	resp := postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_username": "admin", "admin_password": "start1"}, nil)
 	csrf := resp.Header.Get("X-CSRF-Token")
 	resp.Body.Close()
 	if csrf == "" {
 		t.Fatal("setup did not return csrf token")
 	}
 
-	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=save_config", map[string]any{"admin_password": "six123", "traffic_threshold": 95, "api_interval": 600}, map[string]string{"X-CSRF-Token": csrf})
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=save_config", map[string]any{"admin_username": "operator", "admin_password": "six123", "traffic_threshold": 95, "api_interval": 600}, map[string]string{"X-CSRF-Token": csrf})
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -306,6 +379,9 @@ func TestAdminPasswordCanBeChangedFromConfig(t *testing.T) {
 	resp.Body.Close()
 	if !st.CheckAdminPassword("six123") || st.CheckAdminPassword("start1") {
 		t.Fatal("admin password was not changed")
+	}
+	if !st.CheckAdminCredentials("operator", "six123") || st.CheckAdminCredentials("admin", "six123") {
+		t.Fatal("admin username was not changed")
 	}
 
 	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=save_config", map[string]any{"admin_password": "********", "traffic_threshold": 95, "api_interval": 600}, map[string]string{"X-CSRF-Token": csrf})
@@ -334,11 +410,11 @@ func TestPasswordLoginCanBeDisabledAfterPasskeyIsRegistered(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.SetAdminPassword("start1"); err != nil {
+	if err := st.SetAdminCredentials("admin", "start1"); err != nil {
 		t.Fatal(err)
 	}
 
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	httpSrv := httptest.NewServer(srv.Handler())
 	defer httpSrv.Close()
 	client := &http.Client{}
@@ -360,7 +436,7 @@ func TestPasswordLoginCanBeDisabledAfterPasskeyIsRegistered(t *testing.T) {
 		t.Fatalf("password login setting=%q, want 0", got)
 	}
 
-	resp := postJSON(t, client, httpSrv.URL+"/index.php?action=login", map[string]any{"password": "start1"}, nil)
+	resp := postJSON(t, client, httpSrv.URL+"/index.php?action=login", map[string]any{"username": "admin", "password": "start1"}, nil)
 	if resp.StatusCode != http.StatusForbidden {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -380,7 +456,7 @@ func TestPasswordLoginCanBeDisabledAfterPasskeyIsRegistered(t *testing.T) {
 	if err := srv.saveConfig(map[string]any{"password_login_enabled": true}); err != nil {
 		t.Fatalf("re-enable password login: %v", err)
 	}
-	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=login", map[string]any{"password": "start1"}, nil)
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=login", map[string]any{"username": "admin", "password": "start1"}, nil)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -395,7 +471,7 @@ func TestPasskeyWebAuthnUsesForwardedBrowserOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 
 	req := httptest.NewRequest(http.MethodPost, "https://internal:8080/index.php?action=passkey_login_start", nil)
 	req.Host = "internal:8080"
@@ -420,10 +496,12 @@ func TestNotificationSwitchesPersistAndReadBack(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	config := map[string]any{
-		"traffic_threshold": 95,
-		"api_interval":      600,
+		"traffic_threshold":       95,
+		"api_interval":            600,
+		"inventory_sync_enabled":  false,
+		"inventory_sync_interval": 21600,
 		"Notification": map[string]any{
 			"email_enabled": false,
 			"email":         "ops@example.com",
@@ -448,6 +526,9 @@ func TestNotificationSwitchesPersistAndReadBack(t *testing.T) {
 	}
 	if settings["notify_daily_enabled"] != "1" || settings["notify_daily_time"] != "01:30" {
 		t.Fatalf("daily summary settings were not normalized: enabled=%q time=%q", settings["notify_daily_enabled"], settings["notify_daily_time"])
+	}
+	if settings["inventory_sync_enabled"] != "0" || settings["inventory_sync_interval"] != "21600" {
+		t.Fatalf("inventory sync settings were not saved: enabled=%q interval=%q", settings["inventory_sync_enabled"], settings["inventory_sync_interval"])
 	}
 	readBack := notificationSettings(settings)
 	telegram := readBack["telegram"].(map[string]any)
@@ -475,7 +556,7 @@ func TestSaveConfigRejectsDuplicateAccountRegion(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	err = srv.saveConfig(map[string]any{
 		"Accounts": []any{
 			map[string]any{"AccessKeyId": "ak", "AccessKeySecret": "sk", "regionId": "cn-hongkong"},
@@ -497,8 +578,10 @@ func TestSaveConfigSyncsGroupWithGeneratedKey(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
-	srv.CloudFactory = func(app.Account) cloud.Client {
+	srv := New(st, t.TempDir(), "")
+	var receivedAccount app.Account
+	srv.CloudFactory = func(account app.Account) cloud.Client {
+		receivedAccount = account
 		return &fakeSyncClient{instances: []cloud.Instance{{ID: "i-generated", Status: "Running"}}}
 	}
 	if err := srv.saveConfig(map[string]any{
@@ -518,6 +601,9 @@ func TestSaveConfigSyncsGroupWithGeneratedKey(t *testing.T) {
 	}
 	if len(groups) != 1 || groups[0].GroupKey == "" {
 		t.Fatalf("generated group key was not persisted: %#v", groups)
+	}
+	if receivedAccount.AccessKeyID != "ak" || receivedAccount.AccessKeySecret != "sk" || receivedAccount.RegionID != "cn-test" {
+		t.Fatalf("sync did not use the saved account credentials: %#v", receivedAccount)
 	}
 	for _, log := range st.Logs("", 20) {
 		if log["message"] == "账号组同步失败: 账号组不存在" {
@@ -543,7 +629,7 @@ func TestTestAccountResolvesMaskedSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	secret, err := srv.resolveMaskedAccountSecret(map[string]any{"groupKey": "group-1"}, "ak", "cn-hongkong")
 	if err != nil || secret != "sk" {
 		t.Fatalf("masked account secret was not restored: secret=%q err=%v", secret, err)
@@ -593,6 +679,44 @@ func TestTaskResponsePreservesFrontendCredentialFields(t *testing.T) {
 	}
 }
 
+func TestFailedCreateTaskWithInstanceReturnsCredentialOnce(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.CreateTask("task-failed", "preview", "group", "cn-test", "ecs.test", map[string]any{"loginPassword": "Password123!"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTask("task-failed", map[string]any{"status": "failed", "instance_id": "i-created", "login_user": "root", "error_message": "post-create failure"}); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(st, t.TempDir(), "")
+	recorder := httptest.NewRecorder()
+	srv.task(recorder, httptest.NewRequest(http.MethodGet, "/index.php?action=get_ecs_create_task&taskId=task-failed", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("task status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := response["data"].(map[string]any)
+	if data["instanceId"] != "i-created" || data["loginPassword"] != "Password123!" {
+		t.Fatalf("failed task credential missing: %#v", response)
+	}
+	recorder = httptest.NewRecorder()
+	srv.task(recorder, httptest.NewRequest(http.MethodGet, "/index.php?action=get_ecs_create_task&taskId=task-failed", nil))
+	response = map[string]any{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = response["data"].(map[string]any)
+	if data["loginPassword"] != "" {
+		t.Fatalf("failed task credential was returned twice: %#v", response)
+	}
+}
+
 func TestConfigDoesNotDoubleCountCDTAggregateAcrossInstances(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -607,7 +731,7 @@ func TestConfigDoesNotDoubleCountCDTAggregateAcrossInstances(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	recorder := httptest.NewRecorder()
 	srv.config(recorder)
 	if recorder.Code != http.StatusOK {
@@ -627,27 +751,118 @@ func TestConfigDoesNotDoubleCountCDTAggregateAcrossInstances(t *testing.T) {
 	}
 }
 
-type fakePreflightClient struct{ cloud.Client }
+type fakePreflightClient struct {
+	cloud.Client
+	priceRequest cloud.CreatePriceRequest
+	priceErr     error
+	customImages []map[string]any
+	diskImageID  string
+	diskZoneID   string
+}
+
+type fakeStopClient struct {
+	cloud.Client
+	mode string
+}
+
+func (f *fakeStopClient) StopInstance(_ context.Context, _, _, mode string) error {
+	f.mode = mode
+	return nil
+}
 
 func (f *fakePreflightClient) DescribeInstanceType(context.Context, string, string) (map[string]any, error) {
 	return map[string]any{"InstanceTypeId": "ecs.test", "CpuArchitecture": "X86"}, nil
 }
 
-func (f *fakePreflightClient) DescribeAvailableZones(context.Context, string, string, string) ([]map[string]any, error) {
-	return []map[string]any{{"ZoneId": "zone-a", "Status": "Available"}}, nil
+func (f *fakePreflightClient) DescribeAvailableZones(context.Context, string, string, string, string) ([]map[string]any, error) {
+	return []map[string]any{{"ZoneId": "zone-a", "Status": "Available"}, {"ZoneId": "zone-b", "Status": "Available"}}, nil
 }
 
 func (f *fakePreflightClient) DescribeImagesForArchitecture(context.Context, string, string, string) ([]map[string]any, error) {
-	return []map[string]any{{"ImageId": "img-x86", "OSName": "Windows Server 2022"}}, nil
+	return []map[string]any{
+		{"ImageId": "img-x86", "ImageName": "win2022_uefi_x64", "OSName": "Windows Server 2022", "OSType": "windows", "Architecture": "x86_64", "Size": 20},
+		{"ImageId": "img-unlisted", "ImageName": "fedora_42_x64", "OSName": "Fedora 42", "OSType": "linux", "Architecture": "x86_64", "Size": 20},
+	}, nil
 }
 
-func (f *fakePreflightClient) GetSystemDiskOptions(context.Context, string, string, string) ([]map[string]any, error) {
+func (f *fakePreflightClient) DescribeCustomImages(context.Context, string, string) ([]map[string]any, error) {
+	if f.customImages != nil {
+		return f.customImages, nil
+	}
+	return []map[string]any{{"ImageId": "img-custom", "ImageName": "alpine-3.23", "OSName": "Alpine Linux", "OSType": "linux", "Architecture": "x86_64", "Size": 5}}, nil
+}
+
+func (f *fakePreflightClient) GetSystemDiskOptions(_ context.Context, _, zoneID, _, _, imageID string) ([]map[string]any, error) {
+	f.diskImageID = imageID
+	f.diskZoneID = zoneID
 	return []map[string]any{{"value": "cloud_essd", "label": "ESSD", "min": 40, "max": 100, "unit": "GB"}}, nil
+}
+
+func (f *fakePreflightClient) EstimateCreatePrice(_ context.Context, request cloud.CreatePriceRequest) (cloud.CreatePriceEstimate, error) {
+	f.priceRequest = request
+	if f.priceErr != nil {
+		return cloud.CreatePriceEstimate{}, f.priceErr
+	}
+	return cloud.CreatePriceEstimate{Available: true, Currency: "CNY", HourlyPrice: 0.12, DailyPrice: 2.88, MonthlyPrice: 86.4, OriginalHourly: 0.15, DiscountHourly: 0.03, Components: []cloud.PriceComponent{{Resource: "instanceType", Label: "ECS 计算资源", OriginalPrice: 0.1, TradePrice: 0.08}, {Resource: "systemDisk", Label: "系统盘", OriginalPrice: 0.05, DiscountPrice: 0.01, TradePrice: 0.04}}, PublicNetworkNote: "公网流量按实际使用量计费，不包含在固定资源预估中。", Source: "Alibaba Cloud ECS DescribePrice"}, nil
+}
+
+func TestECSImageCloudInitUserData(t *testing.T) {
+	tests := []struct {
+		name       string
+		image      map[string]any
+		wantSystem string
+		wantConfig string
+	}{
+		{name: "Debian", image: map[string]any{"OSName": "Debian 12"}, wantSystem: "Debian", wantConfig: "systemctl try-restart ssh.service"},
+		{name: "Alpine", image: map[string]any{"ImageName": "alpine-3.23.2-x86_64"}, wantSystem: "Alpine", wantConfig: "rc-service sshd restart"},
+		{name: "unsupported", image: map[string]any{"OSName": "Ubuntu 24.04"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			userData, systemName := ecsImageCloudInitUserData(tt.image)
+			if systemName != tt.wantSystem {
+				t.Fatalf("system = %q, want %q", systemName, tt.wantSystem)
+			}
+			if tt.wantConfig == "" {
+				if userData != "" {
+					t.Fatalf("unsupported image unexpectedly received cloud-init: %q", userData)
+				}
+				return
+			}
+			if !strings.Contains(userData, "PasswordAuthentication yes") || !strings.Contains(userData, "PermitRootLogin yes") || !strings.Contains(userData, tt.wantConfig) {
+				t.Fatalf("cloud-init config missing required settings: %q", userData)
+			}
+		})
+	}
+}
+
+func TestManualStopUsesInstanceShutdownMode(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", InstanceID: "i-1", InstanceStatus: "Running", StoppedMode: "StopCharging"}); err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := st.LoadAccounts(false)
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("accounts: %#v %v", accounts, err)
+	}
+	fake := &fakeStopClient{}
+	srv := New(st, t.TempDir(), "")
+	srv.CloudFactory = func(app.Account) cloud.Client { return fake }
+	recorder := httptest.NewRecorder()
+	srv.control(recorder, map[string]any{"accountId": accounts[0].ID, "action": "stop", "shutdownMode": "KeepCharging"})
+	if recorder.Code != http.StatusOK || fake.mode != "StopCharging" {
+		t.Fatalf("manual stop mode=%q status=%d body=%s", fake.mode, recorder.Code, recorder.Body.String())
+	}
 }
 
 type fakeRefreshClient struct {
 	cloud.Client
 	instance      cloud.Instance
+	describeErr   error
 	monthlyBytes  float64
 	monthlyPoints int
 	monthlyErr    error
@@ -660,8 +875,46 @@ type fakeRefreshClient struct {
 }
 
 func (f *fakeRefreshClient) DescribeInstance(context.Context, string, string) (*cloud.Instance, error) {
+	if f.describeErr != nil {
+		return nil, f.describeErr
+	}
 	instance := f.instance
 	return &instance, nil
+}
+
+func TestRefreshAccountHidesInstanceConfirmedMissingFromCloud(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "group-1", InstanceID: "i-missing", InstanceStatus: "Running"}); err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := st.LoadAccounts(false)
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("load account: %#v %v", accounts, err)
+	}
+	srv := New(st, t.TempDir(), "")
+	srv.CloudFactory = func(app.Account) cloud.Client {
+		return &fakeRefreshClient{describeErr: &cloud.APIError{Code: "InvalidInstanceId.NotFound", HTTPStatus: 404}}
+	}
+	recorder := httptest.NewRecorder()
+	srv.refreshAccount(recorder, map[string]any{"id": accounts[0].ID})
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"removed":true`) {
+		t.Fatalf("refresh response: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := st.Account(accounts[0].ID, false); err == nil {
+		t.Fatal("cloud-missing instance remained visible")
+	}
+	hidden, err := st.Account(accounts[0].ID, true)
+	if err != nil || hidden.IsDeleted != 1 || hidden.InstanceStatus != "Releasing" {
+		t.Fatalf("cloud-missing instance was not queued safely: %#v %v", hidden, err)
+	}
+	job, err := st.ClaimJob(time.Minute)
+	if err != nil || job == nil || job.Kind != "delete_instance" || job.EntityKey != fmt.Sprint(accounts[0].ID) {
+		t.Fatalf("missing cleanup job: %#v %v", job, err)
+	}
 }
 
 func (f *fakeRefreshClient) GetInstanceMonthlyTraffic(context.Context, string, string, string, int64, int64) (float64, int, error) {
@@ -706,7 +959,7 @@ func TestRefreshAccountUsesMonthlyCMSValueBeforeDelta(t *testing.T) {
 		deltaLastMS:   now.UnixMilli(),
 		deltaPoints:   1,
 	}
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.CloudFactory = func(app.Account) cloud.Client { return fake }
 	recorder := httptest.NewRecorder()
 	srv.refreshAccount(recorder, map[string]any{"id": 1})
@@ -752,7 +1005,7 @@ func TestRefreshAccountFallsBackToDeltaWhenMonthlyCMSHasNoPoints(t *testing.T) {
 		deltaLastMS:   now.UnixMilli(),
 		deltaPoints:   1,
 	}
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.CloudFactory = func(app.Account) cloud.Client { return fake }
 	recorder := httptest.NewRecorder()
 	srv.refreshAccount(recorder, map[string]any{"id": 1})
@@ -819,7 +1072,7 @@ func TestBillDetailsFiltersRecentItemsAndCachesResult(t *testing.T) {
 		{Date: now.Format("2006-01-02"), ProductName: "云服务器 ECS", Amount: 1.25, Currency: "CNY"},
 		{Date: now.AddDate(0, 0, -20).Format("2006-01-02"), ProductName: "云盘", Amount: 0.10, Currency: "CNY"},
 	}}
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.CloudFactory = func(app.Account) cloud.Client { return fake }
 	body := strings.NewReader(`{"group_key":"group-billing","days":1}`)
 	req := httptest.NewRequest(http.MethodPost, "/index.php?action=get_bill_details", body)
@@ -896,7 +1149,7 @@ func TestSyncGroupPreservesReleaseAndQueuesMissingInstances(t *testing.T) {
 	if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "group-1", InstanceID: "i-missing", InstanceStatus: "Stopped"}); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.CloudFactory = func(app.Account) cloud.Client {
 		return &fakeSyncClient{instances: []cloud.Instance{{ID: "i-release", Status: "Running", PublicIP: "203.0.113.20"}}}
 	}
@@ -908,23 +1161,95 @@ func TestSyncGroupPreservesReleaseAndQueuesMissingInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var release, missing *app.Account
+	var release *app.Account
 	for i := range accounts {
 		switch accounts[i].InstanceID {
 		case "i-release":
 			release = &accounts[i]
-		case "i-missing":
-			missing = &accounts[i]
 		}
 	}
 	if release == nil || release.InstanceStatus != "Releasing" {
 		t.Fatalf("release state was resurrected: %#v", release)
 	}
-	if missing == nil || missing.InstanceStatus != "Releasing" {
-		t.Fatalf("missing instance was not queued: %#v", missing)
+	all, err := st.LoadAccounts(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var missing *app.Account
+	for i := range all {
+		if all[i].InstanceID == "i-missing" {
+			missing = &all[i]
+		}
+	}
+	if missing == nil || missing.InstanceStatus != "Releasing" || missing.IsDeleted != 1 {
+		t.Fatalf("missing instance was not hidden and queued: %#v", missing)
 	}
 	job, err := st.ClaimJob(time.Minute)
 	if err != nil || job == nil || job.EntityKey != fmt.Sprint(missing.ID) {
+		t.Fatalf("missing cleanup job: %#v %v", job, err)
+	}
+}
+
+func TestAutomaticInventoryRequiresTwoConsecutiveMissingObservations(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SaveGroups([]app.AccountGroup{{GroupKey: "group-auto", AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", MaxTraffic: 200}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "group-auto", InstanceID: "i-missing", InstanceStatus: "Stopped"}); err != nil {
+		t.Fatal(err)
+	}
+	accounts, err := st.LoadAccounts(false)
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("load account: %#v %v", accounts, err)
+	}
+	id := accounts[0].ID
+	srv := New(st, t.TempDir(), "")
+	fake := &fakeSyncClient{}
+	srv.CloudFactory = func(app.Account) cloud.Client { return fake }
+
+	if count, err := srv.SyncInventory(context.Background()); err != nil || count != 0 {
+		t.Fatalf("first inventory sync: count=%d err=%v", count, err)
+	}
+	account, err := st.Account(id, false)
+	if err != nil || account.InstanceStatus != "Stopped" {
+		t.Fatalf("first missing observation changed account: %#v %v", account, err)
+	}
+	if job, err := st.ClaimJob(time.Minute); err != nil || job != nil {
+		t.Fatalf("first missing observation queued cleanup: %#v %v", job, err)
+	}
+
+	fake.instances = []cloud.Instance{{ID: "i-missing", Status: "Stopped"}}
+	if count, err := srv.SyncInventory(context.Background()); err != nil || count != 1 {
+		t.Fatalf("reappeared inventory sync: count=%d err=%v", count, err)
+	}
+	fake.instances = nil
+	if count, err := srv.SyncInventory(context.Background()); err != nil || count != 0 {
+		t.Fatalf("missing inventory sync after reset: count=%d err=%v", count, err)
+	}
+	account, err = st.Account(id, false)
+	if err != nil || account.InstanceStatus != "Stopped" {
+		t.Fatalf("missing counter was not reset when instance returned: %#v %v", account, err)
+	}
+	if job, err := st.ClaimJob(time.Minute); err != nil || job != nil {
+		t.Fatalf("first missing observation after reset queued cleanup: %#v %v", job, err)
+	}
+
+	if count, err := srv.SyncInventory(context.Background()); err != nil || count != 0 {
+		t.Fatalf("second consecutive missing inventory sync: count=%d err=%v", count, err)
+	}
+	if account, err = st.Account(id, false); err == nil {
+		t.Fatalf("second missing observation remained visible: %#v", account)
+	}
+	account, err = st.Account(id, true)
+	if err != nil || account.InstanceStatus != "Releasing" || account.IsDeleted != 1 {
+		t.Fatalf("second missing observation did not hide and queue cleanup: %#v %v", account, err)
+	}
+	job, err := st.ClaimJob(time.Minute)
+	if err != nil || job == nil || job.EntityKey != fmt.Sprint(id) {
 		t.Fatalf("missing cleanup job: %#v %v", job, err)
 	}
 }
@@ -941,7 +1266,7 @@ func TestSyncGroupRemovesCloudMissingReleaseFailedRecords(t *testing.T) {
 	if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "group-1", InstanceID: "i-old", PublicIP: "203.0.113.10", InstanceStatus: "ReleaseFailed"}); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.CloudFactory = func(app.Account) cloud.Client {
 		return &fakeSyncClient{instances: []cloud.Instance{{ID: "i-current", Status: "Running", PublicIP: "203.0.113.10"}}}
 	}
@@ -985,7 +1310,7 @@ func TestSyncGroupKeepsReleaseFailedRecordWhenCloudSyncFails(t *testing.T) {
 	if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "group-1", InstanceID: "i-old", InstanceStatus: "ReleaseFailed"}); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.CloudFactory = func(app.Account) cloud.Client {
 		return &fakeSyncClient{describeErr: fmt.Errorf("temporary DescribeInstances failure")}
 	}
@@ -1013,7 +1338,7 @@ func TestSyncGroupKeepsReleaseFailedRecordWhenInstanceStillExists(t *testing.T) 
 	if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "group-1", InstanceID: "i-existing", InstanceStatus: "ReleaseFailed"}); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.CloudFactory = func(app.Account) cloud.Client {
 		return &fakeSyncClient{instances: []cloud.Instance{{ID: "i-existing", Status: "Running"}}}
 	}
@@ -1043,7 +1368,7 @@ func TestSyncGroupRefreshesBoundEIPBandwidth(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.CloudFactory = func(app.Account) cloud.Client {
 		return &fakeSyncClient{
 			instances: []cloud.Instance{{ID: "i-1", Status: "Running", PublicIP: "203.0.113.20"}},
@@ -1080,13 +1405,14 @@ func TestPreviewUsesDynamicArchitectureZoneDiskAndWindowsPort(t *testing.T) {
 	if err := st.SaveGroups([]app.AccountGroup{{GroupKey: "group-1", AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", Remark: "test"}}); err != nil {
 		t.Fatal(err)
 	}
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
-	srv.CloudFactory = func(app.Account) cloud.Client { return &fakePreflightClient{} }
+	srv := New(st, t.TempDir(), "")
+	fake := &fakePreflightClient{customImages: []map[string]any{{"ImageId": "img-custom", "ImageName": "alpine-3.23.2-x86_64", "OSName": "Alpine Linux", "OSType": "linux", "Architecture": "x86_64", "Size": 5}}}
+	srv.CloudFactory = func(app.Account) cloud.Client { return fake }
 	httpSrv := httptest.NewServer(srv.Handler())
 	defer httpSrv.Close()
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Jar: jar}
-	resp := postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_password": "correct horse battery staple"}, map[string]string{"X-Setup-Token": "setup-token"})
+	resp := postJSON(t, client, httpSrv.URL+"/index.php?action=setup", map[string]any{"admin_username": "admin", "admin_password": "correct horse battery staple"}, nil)
 	csrf := resp.Header.Get("X-CSRF-Token")
 	resp.Body.Close()
 	if csrf == "" {
@@ -1094,7 +1420,7 @@ func TestPreviewUsesDynamicArchitectureZoneDiskAndWindowsPort(t *testing.T) {
 	}
 	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=preview_ecs_create", map[string]any{
 		"accountGroupKey": "group-1", "instanceType": "ecs.test", "osKey": "windows_2022", "zoneId": "zone-a",
-		"systemDiskCategory": "cloud_essd_entry", "systemDiskSize": 20, "publicIpMode": "ecs_public_ip", "clientCidrIp": "192.0.2.10/32",
+		"systemDiskCategory": "cloud_essd_entry", "systemDiskSize": 20, "publicIpMode": "ecs_public_ip", "billingMode": "spot", "clientCidrIp": "192.0.2.10/32",
 	}, map[string]string{"X-CSRF-Token": csrf})
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -1108,12 +1434,172 @@ func TestPreviewUsesDynamicArchitectureZoneDiskAndWindowsPort(t *testing.T) {
 	}
 	resp.Body.Close()
 	summary, ok := result["summary"].(map[string]any)
-	if !ok || summary["imageId"] != "img-x86" || summary["loginPort"] != float64(3389) || summary["zoneId"] != "zone-a" {
+	if !ok || summary["imageId"] != "img-x86" || summary["loginPort"] != float64(3389) || summary["zoneId"] != "zone-a" || summary["billingMode"] != "spot" || summary["billingModeLabel"] != "抢占式（市场价）" {
 		t.Fatalf("dynamic preview fields missing: %#v", result)
+	}
+	windowsNetwork, _ := summary["network"].(map[string]any)
+	windowsSecurityGroup, _ := windowsNetwork["securityGroup"].(map[string]any)
+	if windowsSecurityGroup["cidr"] != "192.0.2.10/32" || !strings.Contains(fmt.Sprint(windowsSecurityGroup["rules"]), "TCP 3389 / 192.0.2.10/32") {
+		t.Fatalf("windows preview did not retain restricted RDP access: %#v", windowsSecurityGroup)
 	}
 	disk, ok := summary["systemDisk"].(map[string]any)
 	if !ok || disk["category"] != "cloud_essd" || disk["size"] != float64(40) || disk["min"] != float64(40) {
 		t.Fatalf("dynamic disk fields missing: %#v", summary["systemDisk"])
+	}
+	pricing, ok := result["pricing"].(map[string]any)
+	if !ok || pricing["available"] != true || pricing["hourlyPrice"] != 0.12 || pricing["monthlyPrice"] != 86.4 || pricing["source"] != "Alibaba Cloud ECS DescribePrice" {
+		t.Fatalf("real-time pricing missing from preview: %#v", result["pricing"])
+	}
+	if fake.priceRequest.DiskCategory != "cloud_essd" || fake.priceRequest.DiskSize != 40 || fake.priceRequest.ZoneID != "zone-a" || fake.priceRequest.ImageID != "img-x86" || fake.priceRequest.BillingMode != "spot" {
+		t.Fatalf("pricing did not use final preflight configuration: %#v", fake.priceRequest)
+	}
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=get_ecs_images", map[string]any{
+		"accountGroupKey": "group-1", "instanceType": "ecs.test",
+	}, map[string]string{"X-CSRF-Token": csrf})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("image options status: %d body=%s", resp.StatusCode, body)
+	}
+	var imageOptions map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&imageOptions); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	imageData, _ := imageOptions["data"].(map[string]any)
+	options, _ := imageData["options"].([]any)
+	if len(options) != 2 || options[0].(map[string]any)["value"] != "img-x86" || options[0].(map[string]any)["label"] != "Windows Server 2022" || options[0].(map[string]any)["source"] != "system" || options[1].(map[string]any)["value"] != "img-custom" || options[1].(map[string]any)["source"] != "custom" || options[1].(map[string]any)["size"] != float64(5) {
+		t.Fatalf("merged image options missing: %#v", imageOptions)
+	}
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=get_ecs_disk_options", map[string]any{
+		"accountGroupKey": "group-1", "instanceType": "ecs.test", "imageSource": "system", "imageId": "img-x86", "systemDiskCategory": "cloud_essd",
+	}, map[string]string{"X-CSRF-Token": csrf})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("zone options status: %d body=%s", resp.StatusCode, body)
+	}
+	var zoneResponse map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&zoneResponse); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	zoneData, _ := zoneResponse["data"].(map[string]any)
+	zoneOptions, _ := zoneData["zones"].([]any)
+	diskOptions, _ := zoneData["options"].([]any)
+	if len(zoneOptions) != 2 || zoneOptions[0].(map[string]any)["value"] != "zone-a" || zoneOptions[1].(map[string]any)["value"] != "zone-b" || len(diskOptions) != 0 {
+		t.Fatalf("selectable zones missing or disk options loaded before selection: %#v", zoneResponse)
+	}
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=get_ecs_disk_options", map[string]any{
+		"accountGroupKey": "group-1", "instanceType": "ecs.test", "imageSource": "system", "imageId": "img-x86", "zoneId": "zone-b", "systemDiskCategory": "cloud_essd",
+	}, map[string]string{"X-CSRF-Token": csrf})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("selected zone disk options status: %d body=%s", resp.StatusCode, body)
+	}
+	var selectedZoneResponse map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&selectedZoneResponse); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	selectedZoneData, _ := selectedZoneResponse["data"].(map[string]any)
+	selectedDiskOptions, _ := selectedZoneData["options"].([]any)
+	if selectedZoneData["zoneId"] != "zone-b" || len(selectedDiskOptions) == 0 || fake.diskZoneID != "zone-b" {
+		t.Fatalf("selected zone was not used for disk options: %#v", selectedZoneResponse)
+	}
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=preview_ecs_create", map[string]any{
+		"accountGroupKey": "group-1", "instanceType": "ecs.test", "imageSource": "custom", "imageId": "img-custom", "zoneId": "zone-a",
+		"systemDiskCategory": "cloud_essd", "systemDiskSize": 1, "publicIpMode": "ecs_public_ip", "clientCidrIp": "192.0.2.10/32",
+	}, map[string]string{"X-CSRF-Token": csrf})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("custom image preview status: %d body=%s", resp.StatusCode, body)
+	}
+	var customPreview map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&customPreview); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	customSummary, _ := customPreview["summary"].(map[string]any)
+	customDisk, _ := customSummary["systemDisk"].(map[string]any)
+	if customSummary["imageId"] != "img-custom" || customSummary["imageSource"] != "custom" || customSummary["cloudInitEnabled"] != true || customSummary["loginUser"] != "root" || customDisk["min"] != float64(5) || customDisk["size"] != float64(5) || fake.diskImageID != "img-custom" {
+		t.Fatalf("custom image preview missing: summary=%#v diskImageId=%q", customSummary, fake.diskImageID)
+	}
+	if !strings.Contains(fmt.Sprint(customPreview["warnings"]), "Alpine 自定义镜像将通过 cloud-init") {
+		t.Fatalf("Alpine cloud-init warning missing: %#v", customPreview["warnings"])
+	}
+	fake.priceErr = errors.New("price service unavailable")
+	resp = postJSON(t, client, httpSrv.URL+"/index.php?action=preview_ecs_create", map[string]any{
+		"accountGroupKey": "group-1", "instanceType": "ecs.test", "osKey": "windows_2022", "zoneId": "zone-a",
+		"systemDiskCategory": "cloud_essd_entry", "systemDiskSize": 20, "publicIpMode": "ecs_public_ip", "clientCidrIp": "192.0.2.10/32",
+	}, map[string]string{"X-CSRF-Token": csrf})
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("pricing failure status: %d body=%s", resp.StatusCode, body)
+	}
+	var priceFailure map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&priceFailure); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !strings.Contains(fmt.Sprint(priceFailure["error"]), "费用预估失败") {
+		t.Fatalf("pricing failure was not returned: %#v", priceFailure)
+	}
+}
+
+func TestPreviewAcceptsInstanceScheduleAndStripsRotationGroup(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SaveGroups([]app.AccountGroup{{GroupKey: "group-1", AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", Remark: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveRotationGroups([]app.RotationGroup{{ID: "rotation-1", Name: "亚洲轮转", Domain: "service.example.com", Provider: "dnspod", DNS: app.DNSCredentials{DNSPodSecretID: "id", DNSPodSecretKey: "key", TTL: 600}}}); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(st, t.TempDir(), "")
+	srv.CloudFactory = func(app.Account) cloud.Client { return &fakePreflightClient{} }
+	data := map[string]any{
+		"accountGroupKey": "group-1", "instanceType": "ecs.test", "osKey": "debian_12", "zoneId": "zone-a",
+		"systemDiskCategory": "cloud_essd_entry", "systemDiskSize": 40, "publicIpMode": "ecs_public_ip", "clientCidrIp": "192.0.2.10/32",
+		"scheduleEnabled": true, "startTime": "08:00", "stopTime": "20:00", "stoppedMode": "StopCharging", "rotationGroupId": "rotation-1",
+	}
+	recorder := httptest.NewRecorder()
+	srv.preview(recorder, httptest.NewRequest(http.MethodPost, "/index.php?action=preview_ecs_create", nil), data)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("preview status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var result map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	summary, ok := result["summary"].(map[string]any)
+	if !ok || summary["scheduleEnabled"] != true || summary["startTime"] != "08:00" || summary["stopTime"] != "20:00" || summary["stoppedMode"] != "StopCharging" {
+		t.Fatalf("preview settings missing: %#v", result)
+	}
+	if _, exists := summary["rotationGroupId"]; exists {
+		t.Fatalf("preview still exposes rotation group configuration: %#v", summary)
+	}
+	if _, exists := summary["rotationGroupName"]; exists {
+		t.Fatalf("preview still exposes rotation group name: %#v", summary)
+	}
+	network, _ := summary["network"].(map[string]any)
+	securityGroup, _ := network["securityGroup"].(map[string]any)
+	if securityGroup["cidr"] != "0.0.0.0/0" || !strings.Contains(fmt.Sprint(securityGroup["rules"]), "所有协议 / 所有端口 / 0.0.0.0/0") {
+		t.Fatalf("linux preview does not show all inbound security-group traffic: %#v", securityGroup)
+	}
+	if !strings.Contains(fmt.Sprint(result["warnings"]), "Linux 安全组将向公网放行所有协议和所有端口") {
+		t.Fatalf("linux all-inbound warning missing: %#v", result["warnings"])
 	}
 }
 
@@ -1124,20 +1610,32 @@ func TestOnlineUpdateRequestRequiresUpdaterAndPersistsTarget(t *testing.T) {
 	}
 	defer st.Close()
 
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	request := httptest.NewRequest(http.MethodPost, "/index.php?action=start_update", nil)
 	recorder := httptest.NewRecorder()
-	srv.startUpdate(recorder, request, map[string]any{"target_commit": strings.Repeat("a", 40)})
+	srv.startUpdate(recorder, request, map[string]any{"target_commit": strings.Repeat("a", 40), "target_version": "v1.6.40"})
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unconfigured updater status: %d", recorder.Code)
 	}
 
 	srv.UpdateDir = t.TempDir()
-	srv.imageChecker = func(context.Context, string) (bool, string, error) {
-		return true, "sha256:test", nil
-	}
+	target := strings.Repeat("b", 40)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/elunez/ecs-controller/releases/tags/v1.6.40":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tag_name": "v1.6.40", "assets": []map[string]any{{"name": "checksums.txt"}}})
+		case "/repos/elunez/ecs-controller/commits/v1.6.40":
+			_ = json.NewEncoder(w).Encode(map[string]any{"sha": target, "commit": map[string]any{"message": "release build"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	srv.githubAPIBase = api.URL
+	srv.packageChecker = func(githubRelease, string) bool { return true }
 	recorder = httptest.NewRecorder()
-	srv.startUpdate(recorder, request, map[string]any{"target_commit": strings.Repeat("b", 40)})
+	srv.startUpdate(recorder, request, map[string]any{"target_commit": target, "target_version": "v1.6.40"})
 	if recorder.Code != http.StatusAccepted {
 		t.Fatalf("update request status: %d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -1145,8 +1643,119 @@ func TestOnlineUpdateRequestRequiresUpdaterAndPersistsTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), strings.Repeat("b", 40)) {
+	if !strings.Contains(string(raw), target) || !strings.Contains(string(raw), "v1.6.40") {
 		t.Fatalf("target commit was not persisted: %s", raw)
+	}
+}
+
+func TestValidateRotationGroupsRejectsDuplicateNamesAndUnknownInstances(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for index, instanceID := range []string{"i-1", "i-2", "i-3"} {
+		if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", InstanceID: instanceID, ScheduleEnabled: true, ScheduleStartEnabled: true, ScheduleStopEnabled: true, StartTime: fmt.Sprintf("%02d:00", 8+index*4), StopTime: fmt.Sprintf("%02d:00", 12+index*4)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	accounts, err := st.LoadAccounts(false)
+	if err != nil || len(accounts) != 3 {
+		t.Fatalf("load accounts: %#v %v", accounts, err)
+	}
+	member := func(index int) app.RotationMember {
+		return app.RotationMember{AccountID: accounts[index].ID}
+	}
+	valid := app.RotationGroup{ID: "g-1", Name: "轮转组", Domain: "a.example.com", Provider: "cloudflare", DNS: app.DNSCredentials{CloudflareToken: "token", TTL: 600}, Members: []app.RotationMember{member(0), member(1)}}
+	srv := New(st, t.TempDir(), "")
+	empty := app.RotationGroup{ID: "g-empty", Name: "空分组", Domain: "empty.example.com", Provider: "cloudflare", DNS: app.DNSCredentials{CloudflareToken: "token", TTL: 600}}
+	single := app.RotationGroup{ID: "g-single", Name: "单机分组", Domain: "single.example.com", Provider: "cloudflare", DNS: app.DNSCredentials{CloudflareToken: "token", TTL: 600}, Members: []app.RotationMember{member(2)}}
+	if err := srv.validateRotationGroups([]app.RotationGroup{empty, single}); err != nil {
+		t.Fatalf("empty or single-member group rejected: %v", err)
+	}
+	if err := srv.validateRotationGroups([]app.RotationGroup{valid}); err != nil {
+		t.Fatalf("valid group rejected: %v", err)
+	}
+	duplicateName := valid
+	duplicateName.ID = "g-2"
+	duplicateName.Domain = "b.example.com"
+	duplicateName.Members = []app.RotationMember{member(2), {AccountID: 999}}
+	if err := srv.validateRotationGroups([]app.RotationGroup{valid, duplicateName}); err == nil || !strings.Contains(err.Error(), "分组名称不能重复") {
+		t.Fatalf("duplicate name was accepted: %v", err)
+	}
+	valid.Members[1].AccountID = 999
+	if err := srv.validateRotationGroups([]app.RotationGroup{valid}); err == nil || !strings.Contains(err.Error(), "分组成员实例无效") {
+		t.Fatalf("unknown instance was accepted: %v", err)
+	}
+}
+
+func TestSaveInstanceScheduleValidatesAndProtectsRotationMembers(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, instanceID := range []string{"i-1", "i-2"} {
+		if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", InstanceID: instanceID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	accounts, err := st.LoadAccounts(false)
+	if err != nil || len(accounts) != 2 {
+		t.Fatalf("load accounts: %#v %v", accounts, err)
+	}
+	srv := New(st, t.TempDir(), "")
+	recorder := httptest.NewRecorder()
+	srv.saveInstanceSchedule(recorder, map[string]any{"accountId": accounts[0].ID, "enabled": true, "startTime": "08:00", "stopTime": "18:00", "stoppedMode": "StopCharging"})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("save schedule status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	saved, err := st.Account(accounts[0].ID, false)
+	if err != nil || !saved.ScheduleEnabled || !saved.ScheduleStartEnabled || !saved.ScheduleStopEnabled || saved.StartTime != "08:00" || saved.StopTime != "18:00" || saved.StoppedMode != "StopCharging" {
+		t.Fatalf("schedule was not saved: %#v %v", saved, err)
+	}
+
+	recorder = httptest.NewRecorder()
+	srv.saveInstanceSchedule(recorder, map[string]any{"accountId": accounts[0].ID, "enabled": true, "startTime": "08:00", "stopTime": "08:00"})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("equal times were accepted: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if err := st.SaveRotationGroups([]app.RotationGroup{{ID: "g-1", Name: "轮转组", Domain: "service.example.com", Provider: "dnspod", DNS: app.DNSCredentials{DNSPodSecretID: "id", DNSPodSecretKey: "key", TTL: 600}, Members: []app.RotationMember{{AccountID: accounts[0].ID}, {AccountID: accounts[1].ID}}}}); err != nil {
+		t.Fatal(err)
+	}
+	recorder = httptest.NewRecorder()
+	srv.saveInstanceSchedule(recorder, map[string]any{"accountId": accounts[0].ID, "enabled": false})
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "请先从分组移除") {
+		t.Fatalf("rotation member schedule was disabled: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestSyncGroupPreservesInstanceSchedule(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SaveGroups([]app.AccountGroup{{GroupKey: "group-1", AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", MaxTraffic: 200}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "group-1", InstanceID: "i-1", InstanceStatus: "Stopped", ScheduleEnabled: true, ScheduleStartEnabled: true, ScheduleStopEnabled: true, StartTime: "07:30", StopTime: "19:45", StoppedMode: "StopCharging"}); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(st, t.TempDir(), "")
+	srv.CloudFactory = func(app.Account) cloud.Client {
+		return &fakeSyncClient{instances: []cloud.Instance{{ID: "i-1", Status: "Running", PublicIP: "203.0.113.20"}}}
+	}
+	if count, err := srv.syncGroup("group-1"); err != nil || count != 1 {
+		t.Fatalf("sync result: count=%d err=%v", count, err)
+	}
+	accounts, err := st.LoadAccounts(false)
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("load accounts: %#v %v", accounts, err)
+	}
+	account := accounts[0]
+	if !account.ScheduleEnabled || !account.ScheduleStartEnabled || !account.ScheduleStopEnabled || account.StartTime != "07:30" || account.StopTime != "19:45" || account.StoppedMode != "StopCharging" {
+		t.Fatalf("sync overwrote instance schedule: %#v", account)
 	}
 }
 
@@ -1168,7 +1777,7 @@ func TestUpdateStatusCompletesWhenControllerAlreadyRunsTargetCommit(t *testing.T
 	app.Commit = target
 	defer func() { app.Commit = previousCommit }()
 
-	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv := New(st, t.TempDir(), "")
 	srv.UpdateDir = updateDir
 	recorder := httptest.NewRecorder()
 	srv.updateStatus(recorder)

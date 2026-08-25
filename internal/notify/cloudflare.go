@@ -34,6 +34,11 @@ func CloudflareUpdateRecord(ctx context.Context, token, zoneID, zoneName, name, 
 	return client.Update(ctx, name, address, proxied)
 }
 
+func CloudflareUpdateRecordWithTTL(ctx context.Context, token, zoneID, zoneName, name, address string, ttl int, proxied bool) error {
+	client := NewCloudflareClient(token, zoneID, zoneName)
+	return client.UpdateWithTTL(ctx, name, address, ttl, proxied)
+}
+
 func CloudflareDelete(ctx context.Context, token, zoneID, name string) error {
 	return CloudflareDeleteRecord(ctx, token, zoneID, "", name)
 }
@@ -44,6 +49,10 @@ func CloudflareDeleteRecord(ctx context.Context, token, zoneID, zoneName, name s
 }
 
 func (c *CloudflareClient) Update(ctx context.Context, name, address string, proxied bool) error {
+	return c.UpdateWithTTL(ctx, name, address, 1, proxied)
+}
+
+func (c *CloudflareClient) UpdateWithTTL(ctx context.Context, name, address string, ttl int, proxied bool) error {
 	if err := c.validate(name, address); err != nil {
 		return err
 	}
@@ -55,7 +64,10 @@ func (c *CloudflareClient) Update(ctx context.Context, name, address string, pro
 	if err != nil {
 		return err
 	}
-	payload := map[string]any{"type": "A", "name": strings.ToLower(strings.TrimSuffix(name, ".")), "content": address, "ttl": 1, "proxied": proxied, "comment": "Managed by ECS 控制台"}
+	if ttl < 60 || proxied {
+		ttl = 1
+	}
+	payload := map[string]any{"type": "A", "name": strings.ToLower(strings.TrimSuffix(name, ".")), "content": address, "ttl": ttl, "proxied": proxied, "comment": "Managed by ECS 控制台"}
 	method, endpoint := http.MethodPost, c.endpoint(zoneID, "/dns_records")
 	if len(records) > 0 {
 		method = http.MethodPut

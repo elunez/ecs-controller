@@ -1,83 +1,131 @@
-name: Auto Release
+name: Build and Release
 
 on:
   push:
     branches:
       - main
 
+concurrency:
+  group: ecs-controller-main-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
 jobs:
   release:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      
     steps:
-      - name: Checkout code
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Need full history to list tags
+          fetch-depth: 0
 
-      - name: Generate next version tag
-        id: generate_tag
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: Generate next version
+        id: version
+        shell: bash
         run: |
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -z "$LATEST_TAG" ]; then
-            NEXT_TAG="v1.17.1"
+          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1)"
+          if [[ -z "$latest_tag" ]]; then
+            next_tag="v1.17.1"
+          elif [[ "$latest_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            next_tag="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
           else
-            # Extract major.minor.patch
-            if [[ "$LATEST_TAG" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-              MAJOR="${BASH_REMATCH[1]}"
-              MINOR="${BASH_REMATCH[2]}"
-              PATCH="${BASH_REMATCH[3]}"
-              # Move the release line to v1.17.1 once, then keep patch bumps
-              # on the v1.17 line for subsequent pushes.
-              if (( MAJOR < 1 || (MAJOR == 1 && MINOR < 17) )); then
-                NEXT_TAG="v1.17.1"
-              else
-                NEXT_TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
-              fi
-            else
-              # Fallback if the previous tag format isn't standard
-              NEXT_TAG="v1.17.1"
-            fi
+            echo "无法识别当前版本标签：$latest_tag" >&2
+            exit 1
           fi
-          echo "tag=$NEXT_TAG" >> $GITHUB_OUTPUT
-          echo "previous_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "tag=$next_tag" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        env:
+          ECS_VERSION: ${{ steps.version.outputs.tag }}
+          ECS_COMMIT: ${{ github.sha }}
+          ECS_BUILD_DATE: ${{ github.event.head_commit.timestamp }}
+          OUTPUT_DIR: ${{ runner.temp }}/ecs-controller-binaries
+        run: ./build.sh
+
+      - name: Package release assets
+        shell: bash
+        env:
+          BIN_DIR: ${{ runner.temp }}/ecs-controller-binaries
+        run: |
+          set -Eeuo pipefail
+          release_dir="$RUNNER_TEMP/ecs-controller-release"
+          mkdir -p "$release_dir"
+
+          package_linux() {
+            arch="$1"
+            stage="$(mktemp -d)"
+            cp "$BIN_DIR/ecs-controller-linux-$arch" "$stage/ecs-controller"
+            cp "$BIN_DIR/template.html" "$stage/template.html"
+            cp -R "$BIN_DIR/static" "$stage/static"
+            cp updater.sh "$stage/updater.sh"
+            chmod 0755 "$stage/ecs-controller" "$stage/updater.sh"
+            tar -C "$stage" -czf "$release_dir/ecs-controller-linux-$arch.tar.gz" \
+              ecs-controller updater.sh template.html static
+          }
+
+          package_windows() {
+            arch="$1"
+            stage="$(mktemp -d)"
+            cp "$BIN_DIR/ecs-controller-windows-$arch.exe" "$stage/ecs-controller.exe"
+            cp "$BIN_DIR/template.html" "$stage/template.html"
+            cp -R "$BIN_DIR/static" "$stage/static"
+            (cd "$stage" && zip -qr "$release_dir/ecs-controller-windows-$arch.zip" \
+              ecs-controller.exe template.html static)
+          }
+
+          package_linux amd64
+          package_linux arm64
+          package_windows amd64
+          package_windows arm64
+          (cd "$release_dir" && sha256sum ecs-controller-* > checksums.txt)
+          ls -lh "$release_dir"
 
       - name: Generate release notes
-        id: release_notes
+        id: notes
+        shell: bash
         env:
-          PREVIOUS_TAG: ${{ steps.generate_tag.outputs.previous_tag }}
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous_tag }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          if [ -n "$PREVIOUS_TAG" ]; then
-            COMMIT_RANGE="$PREVIOUS_TAG..HEAD"
-            COMPARE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$PREVIOUS_TAG...${{ steps.generate_tag.outputs.tag }}"
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            commit_range="$PREVIOUS_TAG..HEAD"
+            compare_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$PREVIOUS_TAG...$RELEASE_TAG"
           else
-            COMMIT_RANGE="HEAD"
-            COMPARE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commits/${{ steps.generate_tag.outputs.tag }}"
+            commit_range="HEAD"
+            compare_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commits/$RELEASE_TAG"
           fi
-
           delimiter="RELEASE_NOTES_$(date +%s%N)"
           {
-            echo "notes<<$delimiter"
-            # Release entries use the commit title and body, so keep both user-facing.
-            git log "$COMMIT_RANGE" --format="- **%s** ([%h]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/%H))%n%b%n"
+            echo "body<<$delimiter"
+            git log "$commit_range" --format='- **%s** ([%h]('"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"'/commit/%H))%n%b%n'
+            echo
+            echo "---"
+            echo "[查看完整改动]($compare_url)"
             echo "$delimiter"
-            echo "compare_url=$COMPARE_URL"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create or Update Release
+      - name: Publish GitHub Release
         uses: ncipollo/release-action@v1
         with:
-          tag: ${{ steps.generate_tag.outputs.tag }}
-          name: "Release ${{ steps.generate_tag.outputs.tag }}"
+          tag: ${{ steps.version.outputs.tag }}
+          commit: ${{ github.sha }}
+          name: Release ${{ steps.version.outputs.tag }}
           body: |
             ## 更新内容
 
-            ${{ steps.release_notes.outputs.notes }}
-
-            ---
-            [查看完整改动](${{ steps.release_notes.outputs.compare_url }})
+            ${{ steps.notes.outputs.body }}
+          artifacts: ${{ runner.temp }}/ecs-controller-release/*
+          artifactErrorsFailBuild: true
           allowUpdates: false
           makeLatest: true
           token: ${{ secrets.GITHUB_TOKEN }}

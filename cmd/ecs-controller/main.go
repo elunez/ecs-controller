@@ -21,6 +21,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		fmt.Printf("version=%s\ncommit=%s\nbuild_date=%s\n", app.Version, app.Commit, app.BuildDate)
+		return
+	}
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	dataDir := env("ECS_DATA_DIR", "/var/lib/ecs-controller")
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
@@ -32,9 +36,8 @@ func main() {
 	}
 	defer st.Close()
 
-	client := buildCloudClient()
 	root := env("ECS_APP_DIR", ".")
-	srv := server.New(st, dataDir, filepath.Join(root, "template.html"), os.Getenv("ECS_SETUP_TOKEN"), client)
+	srv := server.New(st, dataDir, filepath.Join(root, "template.html"))
 	srv.CookieSecure = env("ECS_COOKIE_SECURE", "0") == "1" || strings.EqualFold(env("ECS_COOKIE_SECURE", "0"), "true")
 	srv.UpdateDir = env("ECS_UPDATE_DIR", "")
 	srv.CloudFactory = func(group app.Account) cloud.Client {
@@ -42,11 +45,12 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	w := &worker.Worker{Store: st, Cloud: client, CloudFactory: func(group app.AccountGroup) cloud.Client {
+	w := &worker.Worker{Store: st, CloudFactory: func(group app.AccountGroup) cloud.Client {
 		return cloud.NewRPCService(group.AccessKeyID, group.AccessKeySecret, group.RegionID)
-	}, Log: log.Default()}
+	}, InventorySync: srv.SyncInventory, Log: log.Default()}
 	go w.Run(ctx)
 	go w.Monitor(ctx, time.Duration(numberEnv("ECS_MONITOR_INTERVAL", 60))*time.Second)
+	go w.InventoryMonitor(ctx, time.Minute)
 	go w.TelegramControl(ctx)
 
 	addr := env("ECS_HTTP_ADDR", ":8080")
@@ -61,16 +65,6 @@ func main() {
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
-}
-
-func buildCloudClient() cloud.Client {
-	ak, secret := os.Getenv("ALIYUN_ACCESS_KEY_ID"), os.Getenv("ALIYUN_ACCESS_KEY_SECRET")
-	region := env("ALIYUN_REGION_ID", "cn-hongkong")
-	if ak == "" || secret == "" {
-		log.Printf("阿里云凭据未通过环境变量配置；请在账号组中保存凭据并接入凭据工厂后启用真实云操作")
-		return nil
-	}
-	return cloud.NewRPCService(ak, secret, region)
 }
 
 func env(key, fallback string) string {

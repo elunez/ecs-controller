@@ -2,6 +2,16 @@ package app
 
 import "time"
 
+func ResolveShutdownMode(value, fallback string) string {
+	if value == "KeepCharging" || value == "StopCharging" {
+		return value
+	}
+	if fallback == "StopCharging" {
+		return fallback
+	}
+	return "KeepCharging"
+}
+
 type AccountGroup struct {
 	GroupKey                 string  `json:"groupKey"`
 	AccessKeyID              string  `json:"AccessKeyId"`
@@ -10,12 +20,41 @@ type AccountGroup struct {
 	SiteType                 string  `json:"siteType"`
 	MaxTraffic               float64 `json:"maxTraffic"`
 	Remark                   string  `json:"remark"`
-	ScheduleEnabled          bool    `json:"scheduleEnabled"`
-	ScheduleStartEnabled     bool    `json:"scheduleStartEnabled"`
-	ScheduleStopEnabled      bool    `json:"scheduleStopEnabled"`
-	StartTime                string  `json:"startTime"`
-	StopTime                 string  `json:"stopTime"`
 	ScheduleBlockedByTraffic bool    `json:"scheduleBlockedByTraffic"`
+}
+
+type RotationMember struct {
+	AccountID int64 `json:"accountId"`
+}
+
+type DNSCredentials struct {
+	CloudflareToken   string `json:"cloudflareToken"`
+	CloudflareProxied bool   `json:"cloudflareProxied"`
+	DNSPodSecretID    string `json:"dnspodSecretId"`
+	DNSPodSecretKey   string `json:"dnspodSecretKey"`
+	AliDNSAccessKeyID string `json:"alidnsAccessKeyId"`
+	AliDNSSecret      string `json:"alidnsAccessKeySecret"`
+	TTL               int    `json:"ttl"`
+}
+
+type RotationGroup struct {
+	ID                  string           `json:"id"`
+	Name                string           `json:"name"`
+	Domain              string           `json:"domain"`
+	Provider            string           `json:"provider"`
+	AdvanceStartMinutes int              `json:"advanceStartMinutes"`
+	DelayStopMinutes    int              `json:"delayStopMinutes"`
+	DNS                 DNSCredentials   `json:"dns"`
+	Members             []RotationMember `json:"members"`
+}
+
+type RotationState struct {
+	GroupID        string
+	AccountID      int64
+	LastStartDate  string
+	LastStopDate   string
+	DNSUpdatedDate string
+	LastError      string
 }
 
 type Account struct {

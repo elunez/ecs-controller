@@ -150,6 +150,42 @@ func contains(value, needle string) bool {
 	return len(needle) > 0 && len(value) >= len(needle) && stringIndex(value, needle) >= 0
 }
 
+func TestAdminCredentialsRequireUsernameAndPassword(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.SetAdminPassword("secret1"); err != nil {
+		t.Fatal(err)
+	}
+	if s.IsInitialized() {
+		t.Fatal("password without username initialized the store")
+	}
+
+	for _, username := range []string{"ab", "admin name", "管理员", "admin@ecs", strings.Repeat("a", 33)} {
+		if err := s.SetAdminCredentials(username, "secret1"); err == nil {
+			t.Fatalf("invalid username %q was accepted", username)
+		}
+	}
+	if err := s.SetAdminCredentials("admin.test-1", "secret1"); err != nil {
+		t.Fatal(err)
+	}
+	if !s.IsInitialized() {
+		t.Fatal("valid credentials did not initialize the store")
+	}
+	if !s.CheckAdminCredentials("admin.test-1", "secret1") {
+		t.Fatal("valid username and password were rejected")
+	}
+	if s.CheckAdminCredentials("Admin.test-1", "secret1") {
+		t.Fatal("username comparison was not case-sensitive")
+	}
+	if s.CheckAdminCredentials("admin.test-1", "wrong1") {
+		t.Fatal("wrong password was accepted")
+	}
+}
+
 func TestUpsertAccountUpdatesRuntimeState(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {
@@ -195,10 +231,14 @@ func TestDisablingScheduledStopClearsItsAutomationBlock(t *testing.T) {
 	if err := s.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "g", InstanceID: "i-1", ScheduleEnabled: true, ScheduleStopEnabled: true, ScheduleStopActive: true, InstanceStatus: "Stopped"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ApplyGroupSettings(app.AccountGroup{GroupKey: "g", AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", MaxTraffic: 200}); err != nil {
+	accounts, err := s.LoadAccounts(false)
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("load account: %#v %v", accounts, err)
+	}
+	if err := s.UpdateInstanceSchedule(accounts[0].ID, false, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	accounts, err := s.LoadAccounts(false)
+	accounts, err = s.LoadAccounts(false)
 	if err != nil || len(accounts) != 1 || accounts[0].ScheduleStopActive {
 		t.Fatalf("scheduled-stop block was not cleared: %#v %v", accounts, err)
 	}
@@ -253,7 +293,7 @@ func TestLegacyTrafficStatsAndMonthlyReset(t *testing.T) {
 		db.Close()
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO settings(key,value) VALUES('notify_password','legacy-mail-password'),('ddns_cf_token','legacy-cf-token')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO settings(key,value) VALUES('notify_password','legacy-mail-password')`); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}
@@ -290,7 +330,7 @@ func TestLegacyTrafficStatsAndMonthlyReset(t *testing.T) {
 	if err := s.DB.QueryRow(`SELECT value FROM settings WHERE key='notify_password'`).Scan(&rawNotify); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(rawSecret, "ENC1") || !strings.HasPrefix(rawNotify, "ENC1") || s.GetSetting("ddns_cf_token", "") == "legacy-cf-token" {
+	if !strings.HasPrefix(rawSecret, "ENC1") || !strings.HasPrefix(rawNotify, "ENC1") {
 		t.Fatalf("legacy secrets were not encrypted: account=%q notify=%q", rawSecret, rawNotify)
 	}
 	groups, err := s.LoadGroups()
@@ -387,6 +427,68 @@ func TestLegacyAdminPasswordFormatsUpgradeOnLogin(t *testing.T) {
 	}
 	if !s.CheckAdminPassword(password) || s.GetSetting("admin_password", "") == argonEncoded {
 		t.Fatal("PHP Argon2 password was not accepted and upgraded")
+	}
+}
+
+func TestRotationGroupsEncryptSecretsAndPreserveMaskedValues(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	group := app.RotationGroup{
+		ID: "group-1", Name: "轮转组", Domain: "service.example.com", Provider: "dnspod",
+		DNS:     app.DNSCredentials{DNSPodSecretID: "secret-id", DNSPodSecretKey: "secret-key", TTL: 600},
+		Members: []app.RotationMember{{AccountID: 1}, {AccountID: 2}},
+	}
+	if err := s.SaveRotationGroups([]app.RotationGroup{group}); err != nil {
+		t.Fatal(err)
+	}
+	if raw := s.GetSetting("rotation_groups", ""); strings.Contains(raw, "secret-key") {
+		t.Fatalf("secret leaked into plain settings: %s", raw)
+	}
+	if raw := s.GetSetting("rotation_group_secrets", ""); !strings.HasPrefix(raw, "ENC1") || strings.Contains(raw, "secret-key") {
+		t.Fatalf("secret payload was not encrypted: %q", raw)
+	}
+	loaded, err := s.LoadRotationGroups()
+	if err != nil || len(loaded) != 1 || loaded[0].DNS.DNSPodSecretKey != "secret-key" {
+		t.Fatalf("load groups: %#v %v", loaded, err)
+	}
+	loaded[0].Name = "新名称"
+	loaded[0].DNS.DNSPodSecretKey = "********"
+	if err := s.SaveRotationGroups(loaded); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.LoadRotationGroups()
+	if err != nil || loaded[0].Name != "新名称" || loaded[0].DNS.DNSPodSecretKey != "secret-key" {
+		t.Fatalf("masked secret was not preserved: %#v %v", loaded, err)
+	}
+}
+
+func TestFailedTaskWithCreatedInstanceAllowsOneTimeCredentialRecovery(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.CreateTask("task-partial", "preview", "group", "cn-test", "ecs.test", map[string]any{"loginPassword": "Password123!"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTask("task-partial", map[string]any{"status": "failed", "instance_id": "i-created", "login_user": "root"}); err != nil {
+		t.Fatal(err)
+	}
+	available, err := s.CredentialTaskInstances()
+	if err != nil || !available["i-created"] {
+		t.Fatalf("credential availability missing: %#v err=%v", available, err)
+	}
+	first, err := s.ConsumeInstanceTaskPassword("i-created")
+	if err != nil || first.LoginPassword != "Password123!" || first.LoginUser != "root" {
+		t.Fatalf("first credential recovery: task=%#v err=%v", first, err)
+	}
+	second, err := s.ConsumeInstanceTaskPassword("i-created")
+	if err == nil || second != nil {
+		t.Fatalf("credential was not one-time: task=%#v err=%v", second, err)
 	}
 }
 

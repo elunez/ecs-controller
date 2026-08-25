@@ -2,9 +2,13 @@ package cloud
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,7 +32,8 @@ type RunRequest struct {
 	RegionID, ZoneID, InstanceType, ImageID, InstanceName string
 	VPCID, VSwitchID, SecurityGroupID                     string
 	Bandwidth, DiskSize, LoginPort                        int
-	DiskCategory, PublicIPMode, Password, ClientToken     string
+	DiskCategory, PublicIPMode, BillingMode               string
+	Password, ClientToken, UserData                       string
 }
 
 type RunResult struct{ InstanceID, PublicIP string }
@@ -58,9 +63,72 @@ type Client interface {
 // clients used by monitoring and unit tests.
 type PreflightClient interface {
 	DescribeInstanceType(context.Context, string, string) (map[string]any, error)
-	DescribeAvailableZones(context.Context, string, string, string) ([]map[string]any, error)
+	DescribeAvailableZones(context.Context, string, string, string, string) ([]map[string]any, error)
 	DescribeImagesForArchitecture(context.Context, string, string, string) ([]map[string]any, error)
-	GetSystemDiskOptions(context.Context, string, string, string) ([]map[string]any, error)
+	DescribeCustomImages(context.Context, string, string) ([]map[string]any, error)
+	GetSystemDiskOptions(context.Context, string, string, string, string, string) ([]map[string]any, error)
+}
+
+type CreatePriceRequest struct {
+	RegionID      string
+	ZoneID        string
+	InstanceType  string
+	ImageID       string
+	DiskCategory  string
+	DiskSize      int
+	PublicIPMode  string
+	BillingMode   string
+	BandwidthMbps int
+}
+
+const (
+	BillingModePostpaid = "postpaid"
+	BillingModeSpot     = "spot"
+	AllInboundPorts     = -1
+)
+
+func spotStrategy(billingMode string) string {
+	if billingMode == BillingModeSpot {
+		return "SpotAsPriceGo"
+	}
+	return "NoSpot"
+}
+
+func systemDiskPerformanceLevel(category string, size int) string {
+	if category == "cloud_essd" && size > 0 && size < 20 {
+		return "PL0"
+	}
+	return ""
+}
+
+type PriceComponent struct {
+	Resource      string  `json:"resource"`
+	Label         string  `json:"label"`
+	OriginalPrice float64 `json:"originalPrice"`
+	DiscountPrice float64 `json:"discountPrice"`
+	TradePrice    float64 `json:"tradePrice"`
+}
+
+type CreatePriceEstimate struct {
+	Available         bool             `json:"available"`
+	Currency          string           `json:"currency"`
+	HourlyPrice       float64          `json:"hourlyPrice"`
+	DailyPrice        float64          `json:"dailyPrice"`
+	MonthlyPrice      float64          `json:"monthlyPrice"`
+	OriginalHourly    float64          `json:"originalHourly"`
+	DiscountHourly    float64          `json:"discountHourly"`
+	Components        []PriceComponent `json:"components"`
+	TrafficUnitPrice  float64          `json:"trafficUnitPrice,omitempty"`
+	TrafficUnit       string           `json:"trafficUnit,omitempty"`
+	PublicNetworkNote string           `json:"publicNetworkNote"`
+	EstimationNote    string           `json:"estimationNote"`
+	Source            string           `json:"source"`
+}
+
+// CreatePriceClient is optional so monitoring-only cloud fakes remain small.
+// The production RPC service implements it for the create preview.
+type CreatePriceClient interface {
+	EstimateCreatePrice(context.Context, CreatePriceRequest) (CreatePriceEstimate, error)
 }
 
 type BillingClient interface {
@@ -154,6 +222,17 @@ type NetworkClient interface {
 	PrepareNetworkForPort(context.Context, string, string, string, string, int) (string, string, string, error)
 }
 
+type PreparedNetwork struct {
+	VPCID, VSwitchID, SecurityGroupID     string
+	CreatedVPC, CreatedVSwitch, CreatedSG bool
+}
+
+// ReusableNetworkClient returns resource ownership so a failed create only
+// removes network resources that were created by that attempt.
+type ReusableNetworkClient interface {
+	PrepareReusableNetworkForPort(context.Context, string, string, string, string, int) (PreparedNetwork, error)
+}
+
 // BandwidthEIPClient preserves the legacy AllocateEIP method while allowing
 // ECS creation and replacement to carry the user's selected bandwidth.
 type BandwidthEIPClient interface {
@@ -208,16 +287,37 @@ func (s *Service) DescribeImagesForArchitecture(ctx context.Context, region, osK
 	return s.describeImages(ctx, region, osKey, architecture)
 }
 
-func (s *Service) describeImages(ctx context.Context, region, osKey, architecture string) ([]map[string]any, error) {
-	params := map[string]string{"RegionId": region, "Status": "Available", "ImageOwnerAlias": "system", "PageSize": "100"}
-	if architecture != "" {
-		params["Architecture"] = architecture
+func (s *Service) DescribeCustomImages(ctx context.Context, region, architecture string) ([]map[string]any, error) {
+	return s.describeImagesByOwner(ctx, region, "self", architecture)
+}
+
+func (s *Service) describeImagesByOwner(ctx context.Context, region, ownerAlias, architecture string) ([]map[string]any, error) {
+	const pageSize = 100
+	images := make([]map[string]any, 0)
+	for page := 1; ; page++ {
+		params := map[string]string{"RegionId": region, "Status": "Available", "ImageOwnerAlias": ownerAlias, "PageSize": strconv.Itoa(pageSize), "PageNumber": strconv.Itoa(page)}
+		if architecture != "" {
+			params["Architecture"] = architecture
+		}
+		result, err := s.ECS.Call(ctx, "DescribeImages", params)
+		if err != nil {
+			return nil, err
+		}
+		pageImages := mapsAt(result, "Images.Image")
+		images = append(images, pageImages...)
+		total := intValue(result["TotalCount"])
+		if len(pageImages) < pageSize || (total > 0 && len(images) >= total) {
+			break
+		}
 	}
-	result, err := s.ECS.Call(ctx, "DescribeImages", params)
+	return images, nil
+}
+
+func (s *Service) describeImages(ctx context.Context, region, osKey, architecture string) ([]map[string]any, error) {
+	images, err := s.describeImagesByOwner(ctx, region, "system", architecture)
 	if err != nil {
 		return nil, err
 	}
-	images := mapsAt(result, "Images.Image")
 	key := strings.ToLower(osKey)
 	out := make([]map[string]any, 0)
 	for _, image := range images {
@@ -247,8 +347,8 @@ func (s *Service) DescribeInstanceType(ctx context.Context, region, instanceType
 	return types[0], nil
 }
 
-func (s *Service) DescribeAvailableZones(ctx context.Context, region, instanceType, diskCategory string) ([]map[string]any, error) {
-	params := map[string]string{"RegionId": region, "DestinationResource": "Zone", "InstanceType": instanceType, "InstanceChargeType": "PostPaid", "SpotStrategy": "NoSpot", "NetworkCategory": "vpc", "IoOptimized": "optimized", "AvailableResourceCreation": "Instance"}
+func (s *Service) DescribeAvailableZones(ctx context.Context, region, instanceType, diskCategory, billingMode string) ([]map[string]any, error) {
+	params := map[string]string{"RegionId": region, "DestinationResource": "Zone", "InstanceType": instanceType, "InstanceChargeType": "PostPaid", "SpotStrategy": spotStrategy(billingMode), "NetworkCategory": "vpc", "IoOptimized": "optimized", "AvailableResourceCreation": "Instance"}
 	if diskCategory != "" {
 		params["SystemDisk.Category"] = diskCategory
 	}
@@ -276,8 +376,12 @@ func (s *Service) DescribeImagesWithArchitecture(ctx context.Context, region, os
 	return s.describeImages(ctx, region, osKey, architecture)
 }
 
-func (s *Service) GetSystemDiskOptions(ctx context.Context, region, zone, instanceType string) ([]map[string]any, error) {
-	result, err := s.ECS.Call(ctx, "DescribeAvailableResource", map[string]string{"RegionId": region, "ZoneId": zone, "DestinationResource": "SystemDisk", "InstanceType": instanceType, "InstanceChargeType": "PostPaid", "SpotStrategy": "NoSpot", "NetworkCategory": "vpc", "IoOptimized": "optimized"})
+func (s *Service) GetSystemDiskOptions(ctx context.Context, region, zone, instanceType, billingMode, imageID string) ([]map[string]any, error) {
+	params := map[string]string{"RegionId": region, "ZoneId": zone, "DestinationResource": "SystemDisk", "InstanceType": instanceType, "InstanceChargeType": "PostPaid", "SpotStrategy": spotStrategy(billingMode), "NetworkCategory": "vpc", "IoOptimized": "optimized"}
+	if imageID != "" {
+		params["ImageId"] = imageID
+	}
+	result, err := s.ECS.Call(ctx, "DescribeAvailableResource", params)
 	if err != nil {
 		return nil, err
 	}
@@ -479,7 +583,7 @@ func (s *Service) RunInstances(ctx context.Context, req RunRequest) (RunResult, 
 	if clientToken == "" {
 		clientToken = req.InstanceName
 	}
-	p := map[string]string{"RegionId": req.RegionID, "ZoneId": req.ZoneID, "InstanceType": req.InstanceType, "ImageId": req.ImageID, "InstanceName": req.InstanceName, "VSwitchId": req.VSwitchID, "SecurityGroupId.1": req.SecurityGroupID, "InternetMaxBandwidthOut": strconv.Itoa(bandwidth), "AllocatePublicIp": allocatePublicIP, "InternetChargeType": "PayByTraffic", "InstanceChargeType": "PostPaid", "Password": req.Password, "Amount": "1", "ClientToken": clientToken, "IoOptimized": "optimized", "DeletionProtection": "false"}
+	p := map[string]string{"RegionId": req.RegionID, "ZoneId": req.ZoneID, "InstanceType": req.InstanceType, "ImageId": req.ImageID, "InstanceName": req.InstanceName, "VSwitchId": req.VSwitchID, "SecurityGroupId": req.SecurityGroupID, "InternetMaxBandwidthOut": strconv.Itoa(bandwidth), "AllocatePublicIp": allocatePublicIP, "InternetChargeType": "PayByTraffic", "InstanceChargeType": "PostPaid", "SpotStrategy": spotStrategy(req.BillingMode), "Password": req.Password, "Amount": "1", "ClientToken": clientToken, "IoOptimized": "optimized", "DeletionProtection": "false"}
 	if req.VPCID != "" {
 		p["VpcId"] = req.VPCID
 	}
@@ -489,17 +593,143 @@ func (s *Service) RunInstances(ctx context.Context, req RunRequest) (RunResult, 
 	if req.DiskSize > 0 {
 		p["SystemDisk.Size"] = strconv.Itoa(req.DiskSize)
 	}
+	if performanceLevel := systemDiskPerformanceLevel(req.DiskCategory, req.DiskSize); performanceLevel != "" {
+		p["SystemDisk.PerformanceLevel"] = performanceLevel
+	}
+	if userData := req.UserData; strings.TrimSpace(userData) != "" {
+		if len([]byte(userData)) > 16<<10 {
+			return RunResult{}, fmt.Errorf("cloud-init UserData exceeds 16 KiB")
+		}
+		p["UserData"] = base64.StdEncoding.EncodeToString([]byte(userData))
+	}
 	result, err := s.ECS.Call(ctx, "RunInstances", p)
 	if err != nil {
 		return RunResult{}, err
 	}
-	id := stringValue(result["InstanceId"])
-	if id == "" {
-		if ids := mapsAt(result, "InstanceIdSet.InstanceId"); len(ids) > 0 {
-			id = stringValue(ids[0]["InstanceId"])
-		}
-	}
+	id := firstRunInstanceID(result)
 	return RunResult{InstanceID: id, PublicIP: stringValue(result["PublicIpAddress"])}, nil
+}
+
+func firstRunInstanceID(result map[string]any) string {
+	if id := strings.TrimSpace(stringValue(result["InstanceId"])); id != "" {
+		return id
+	}
+	sets, _ := result["InstanceIdSets"].(map[string]any)
+	switch ids := sets["InstanceIdSet"].(type) {
+	case []any:
+		if len(ids) > 0 {
+			return strings.TrimSpace(stringValue(ids[0]))
+		}
+	case []string:
+		if len(ids) > 0 {
+			return strings.TrimSpace(ids[0])
+		}
+	case string:
+		return strings.TrimSpace(ids)
+	}
+	return ""
+}
+
+func (s *Service) EstimateCreatePrice(ctx context.Context, req CreatePriceRequest) (CreatePriceEstimate, error) {
+	bandwidth := req.BandwidthMbps
+	if req.PublicIPMode == "eip" {
+		bandwidth = 0
+	}
+	params := map[string]string{
+		"RegionId":                req.RegionID,
+		"ZoneId":                  req.ZoneID,
+		"ResourceType":            "instance",
+		"InstanceType":            req.InstanceType,
+		"InstanceChargeType":      "PostPaid",
+		"SpotStrategy":            spotStrategy(req.BillingMode),
+		"ImageId":                 req.ImageID,
+		"IoOptimized":             "optimized",
+		"InstanceNetworkType":     "vpc",
+		"InternetChargeType":      "PayByTraffic",
+		"InternetMaxBandwidthOut": strconv.Itoa(bandwidth),
+		"SystemDisk.Category":     req.DiskCategory,
+		"SystemDisk.Size":         strconv.Itoa(req.DiskSize),
+		"PriceUnit":               "Hour",
+		"Period":                  "1",
+		"Amount":                  "1",
+	}
+	if performanceLevel := systemDiskPerformanceLevel(req.DiskCategory, req.DiskSize); performanceLevel != "" {
+		params["SystemDisk.PerformanceLevel"] = performanceLevel
+	}
+	result, err := s.ECS.Call(ctx, "DescribePrice", params)
+	if err != nil {
+		return CreatePriceEstimate{}, err
+	}
+	priceInfo, ok := result["PriceInfo"].(map[string]any)
+	if !ok {
+		return CreatePriceEstimate{}, fmt.Errorf("DescribePrice response missing PriceInfo")
+	}
+	price, ok := priceInfo["Price"].(map[string]any)
+	if !ok {
+		return CreatePriceEstimate{}, fmt.Errorf("DescribePrice response missing PriceInfo.Price")
+	}
+	original := floatValue(price["OriginalPrice"])
+	discount := floatValue(price["DiscountPrice"])
+	trade := floatValue(price["TradePrice"])
+	if _, exists := price["TradePrice"]; !exists {
+		trade = original - discount
+	}
+	if trade < 0 {
+		trade = 0
+	}
+	currency := strings.TrimSpace(stringValue(price["Currency"]))
+	if currency == "" {
+		currency = "CNY"
+	}
+	components := make([]PriceComponent, 0)
+	trafficUnitPrice := 0.0
+	componentOriginalTotal, componentDiscountTotal, componentTradeTotal := 0.0, 0.0, 0.0
+	for _, detail := range mapsAt(priceInfo, "DetailInfos.DetailInfo") {
+		componentOriginal := floatValue(detail["OriginalPrice"])
+		componentDiscount := floatValue(detail["DiscountPrice"])
+		componentTrade := componentOriginal - componentDiscount
+		if componentTrade < 0 {
+			componentTrade = 0
+		}
+		resource := stringValue(detail["Resource"])
+		if resource == "bandwidth" && req.PublicIPMode != "eip" {
+			trafficUnitPrice = roundPrice(componentTrade)
+			continue
+		}
+		componentOriginalTotal += componentOriginal
+		componentDiscountTotal += componentDiscount
+		componentTradeTotal += componentTrade
+		components = append(components, PriceComponent{Resource: resource, Label: priceResourceLabel(resource), OriginalPrice: roundPrice(componentOriginal), DiscountPrice: roundPrice(componentDiscount), TradePrice: roundPrice(componentTrade)})
+	}
+	if len(components) > 0 {
+		original, discount, trade = componentOriginalTotal, componentDiscountTotal, componentTradeTotal
+	}
+	networkNote := "公网流量按实际使用量计费，不包含在固定资源预估中。"
+	if req.PublicIPMode == "eip" {
+		networkNote = "创建时不分配公网 IP；后续自行绑定的 EIP 及公网流量费用不包含在预估中。"
+	}
+	return CreatePriceEstimate{Available: true, Currency: currency, HourlyPrice: roundPrice(trade), DailyPrice: roundPrice(trade * 24), MonthlyPrice: roundPrice(trade * 24 * 30), OriginalHourly: roundPrice(original), DiscountHourly: roundPrice(discount), Components: components, TrafficUnitPrice: trafficUnitPrice, TrafficUnit: "GB", PublicNetworkNote: networkNote, EstimationNote: "30 天按连续运行 720 小时估算，最终费用以阿里云账单为准。", Source: "Alibaba Cloud ECS DescribePrice"}, nil
+}
+
+func roundPrice(value float64) float64 {
+	return math.Round(value*1_000_000) / 1_000_000
+}
+
+func priceResourceLabel(resource string) string {
+	switch resource {
+	case "instanceType":
+		return "ECS 计算资源"
+	case "systemDisk":
+		return "系统盘"
+	case "dataDisk":
+		return "数据盘"
+	case "bandwidth":
+		return "公网带宽"
+	case "image":
+		return "镜像"
+	default:
+		return resource
+	}
 }
 
 func (s *Service) AllocateEIP(ctx context.Context, region string) (string, string, error) {
@@ -514,7 +744,7 @@ func (s *Service) AllocateEIPWithBandwidth(ctx context.Context, region string, b
 	return stringValue(result["AllocationId"]), stringValue(result["EipAddress"]), err
 }
 func (s *Service) AssociateEIP(ctx context.Context, region, allocationID, instanceID string) error {
-	_, err := s.EIP.Call(ctx, "AssociateEipAddress", map[string]string{"RegionId": region, "AllocationId": allocationID, "InstanceId": instanceID, "InstanceType": "Ecs"})
+	_, err := s.EIP.Call(ctx, "AssociateEipAddress", map[string]string{"RegionId": region, "AllocationId": allocationID, "InstanceId": instanceID, "InstanceType": "EcsInstance"})
 	return err
 }
 func (s *Service) UnassociateEIP(ctx context.Context, region, allocationID string) error {
@@ -967,32 +1197,211 @@ func (s *Service) PrepareNetwork(ctx context.Context, region, cidr, zone, client
 }
 
 func (s *Service) PrepareNetworkForPort(ctx context.Context, region, cidr, zone, clientCIDR string, port int) (string, string, string, error) {
-	// Network provisioning is deliberately explicit. Existing resources can be
-	// selected by the caller; this path creates a minimal isolated network.
-	vpc, err := s.VPC.Call(ctx, "CreateVpc", map[string]string{"RegionId": region, "CidrBlock": cidr, "VpcName": "ecs-controller"})
+	network, err := s.PrepareReusableNetworkForPort(ctx, region, cidr, zone, clientCIDR, port)
+	return network.VPCID, network.VSwitchID, network.SecurityGroupID, err
+}
+
+func (s *Service) PrepareReusableNetworkForPort(ctx context.Context, region, cidr, zone, clientCIDR string, port int) (PreparedNetwork, error) {
+	const resourceName = "ecs-controller"
+	network := PreparedNetwork{}
+
+	vpcs, err := s.VPC.Call(ctx, "DescribeVpcs", map[string]string{"RegionId": region, "VpcName": resourceName})
 	if err != nil {
-		return "", "", "", err
+		return network, err
 	}
-	vpcID := stringValue(vpc["VpcId"])
-	vs, err := s.VPC.Call(ctx, "CreateVSwitch", map[string]string{"RegionId": region, "VpcId": vpcID, "ZoneId": zone, "CidrBlock": "192.168.0.0/24", "VSwitchName": "ecs-controller"})
+	for _, item := range mapsAt(vpcs, "Vpcs.Vpc") {
+		if firstString(item, "VpcName", "vpcName") == resourceName && firstString(item, "CidrBlock", "cidrBlock") == cidr && strings.EqualFold(firstString(item, "Status", "status"), "Available") {
+			network.VPCID = firstString(item, "VpcId", "vpcId")
+			break
+		}
+	}
+	if network.VPCID == "" {
+		vpc, createErr := s.VPC.Call(ctx, "CreateVpc", map[string]string{"RegionId": region, "CidrBlock": cidr, "VpcName": resourceName})
+		if createErr != nil {
+			return network, createErr
+		}
+		network.VPCID = stringValue(vpc["VpcId"])
+		network.CreatedVPC = true
+		if network.VPCID == "" {
+			return network, fmt.Errorf("CreateVpc response missing VpcId")
+		}
+		if err = waitForNetworkResource(ctx, "VPC", network.VPCID, func() (string, error) {
+			result, describeErr := s.VPC.Call(ctx, "DescribeVpcs", map[string]string{"RegionId": region, "VpcId": network.VPCID})
+			if describeErr != nil {
+				return "", describeErr
+			}
+			return firstNetworkResourceStatus(mapsAt(result, "Vpcs.Vpc")), nil
+		}); err != nil {
+			return network, err
+		}
+	}
+
+	vswitches, err := s.VPC.Call(ctx, "DescribeVSwitches", map[string]string{"RegionId": region, "VpcId": network.VPCID})
 	if err != nil {
-		return vpcID, "", "", err
+		return network, err
 	}
-	vsID := stringValue(vs["VSwitchId"])
-	sg, err := s.ECS.Call(ctx, "CreateSecurityGroup", map[string]string{"RegionId": region, "VpcId": vpcID, "SecurityGroupName": "ecs-controller"})
+	allVSwitches := mapsAt(vswitches, "VSwitches.VSwitch")
+	for _, item := range allVSwitches {
+		if firstString(item, "VSwitchName", "vSwitchName") == resourceName && firstString(item, "VpcId", "vpcId") == network.VPCID && firstString(item, "ZoneId", "zoneId") == zone && strings.EqualFold(firstString(item, "Status", "status"), "Available") {
+			network.VSwitchID = firstString(item, "VSwitchId", "vSwitchId")
+			break
+		}
+	}
+	if network.VSwitchID == "" {
+		usedCIDRs := make([]string, 0, len(allVSwitches))
+		for _, item := range allVSwitches {
+			if block := firstString(item, "CidrBlock", "cidrBlock"); block != "" {
+				usedCIDRs = append(usedCIDRs, block)
+			}
+		}
+		vswitchCIDR, cidrErr := nextAvailableVSwitchCIDR(cidr, usedCIDRs)
+		if cidrErr != nil {
+			return network, cidrErr
+		}
+		vs, createErr := s.VPC.Call(ctx, "CreateVSwitch", map[string]string{"RegionId": region, "VpcId": network.VPCID, "ZoneId": zone, "CidrBlock": vswitchCIDR, "VSwitchName": resourceName})
+		if createErr != nil {
+			return network, createErr
+		}
+		network.VSwitchID = stringValue(vs["VSwitchId"])
+		network.CreatedVSwitch = true
+		if network.VSwitchID == "" {
+			return network, fmt.Errorf("CreateVSwitch response missing VSwitchId")
+		}
+		if err = waitForNetworkResource(ctx, "交换机", network.VSwitchID, func() (string, error) {
+			result, describeErr := s.VPC.Call(ctx, "DescribeVSwitches", map[string]string{"RegionId": region, "VSwitchId": network.VSwitchID})
+			if describeErr != nil {
+				return "", describeErr
+			}
+			return firstNetworkResourceStatus(mapsAt(result, "VSwitches.VSwitch")), nil
+		}); err != nil {
+			return network, err
+		}
+	}
+
+	groups, err := s.ECS.Call(ctx, "DescribeSecurityGroups", map[string]string{"RegionId": region, "VpcId": network.VPCID, "SecurityGroupName": resourceName})
 	if err != nil {
-		return vpcID, vsID, "", err
+		return network, err
 	}
-	sgID := stringValue(sg["SecurityGroupId"])
+	for _, item := range mapsAt(groups, "SecurityGroups.SecurityGroup") {
+		if firstString(item, "SecurityGroupName", "securityGroupName") == resourceName && firstString(item, "VpcId", "vpcId") == network.VPCID {
+			network.SecurityGroupID = firstString(item, "SecurityGroupId", "securityGroupId")
+			break
+		}
+	}
+	if network.SecurityGroupID == "" {
+		sg, createErr := s.ECS.Call(ctx, "CreateSecurityGroup", map[string]string{"RegionId": region, "VpcId": network.VPCID, "SecurityGroupName": resourceName})
+		if createErr != nil {
+			return network, createErr
+		}
+		network.SecurityGroupID = stringValue(sg["SecurityGroupId"])
+		network.CreatedSG = true
+		if network.SecurityGroupID == "" {
+			return network, fmt.Errorf("CreateSecurityGroup response missing SecurityGroupId")
+		}
+	}
+	if port == AllInboundPorts {
+		if _, authErr := s.ECS.Call(ctx, "AuthorizeSecurityGroup", map[string]string{"RegionId": region, "SecurityGroupId": network.SecurityGroupID, "IpProtocol": "all", "PortRange": "-1/-1", "SourceCidrIp": "0.0.0.0/0", "Policy": "accept", "Priority": "1", "Description": "ecs-controller linux all inbound"}); authErr != nil && !isDuplicatePermission(authErr) {
+			return network, authErr
+		}
+		return network, nil
+	}
 	if port <= 0 {
 		port = 22
 	}
 	if clientCIDR != "" && clientCIDR != "0.0.0.0/0" {
-		if _, authErr := s.ECS.Call(ctx, "AuthorizeSecurityGroup", map[string]string{"RegionId": region, "SecurityGroupId": sgID, "IpProtocol": "tcp", "PortRange": strconv.Itoa(port) + "/" + strconv.Itoa(port), "SourceCidrIp": clientCIDR, "Policy": "accept", "Priority": "1", "Description": "ecs-controller remote access"}); authErr != nil {
-			return vpcID, vsID, sgID, authErr
+		if _, authErr := s.ECS.Call(ctx, "AuthorizeSecurityGroup", map[string]string{"RegionId": region, "SecurityGroupId": network.SecurityGroupID, "IpProtocol": "tcp", "PortRange": strconv.Itoa(port) + "/" + strconv.Itoa(port), "SourceCidrIp": clientCIDR, "Policy": "accept", "Priority": "1", "Description": "ecs-controller remote access"}); authErr != nil && !isDuplicatePermission(authErr) {
+			return network, authErr
 		}
 	}
-	return vpcID, vsID, sgID, nil
+	return network, nil
+}
+
+func nextAvailableVSwitchCIDR(vpcCIDR string, usedCIDRs []string) (string, error) {
+	vpc, err := netip.ParsePrefix(vpcCIDR)
+	if err != nil || !vpc.Addr().Is4() {
+		return "", fmt.Errorf("VPC IPv4 网段无效: %s", vpcCIDR)
+	}
+	vpc = vpc.Masked()
+	subnetBits := 24
+	if vpc.Bits() > subnetBits {
+		subnetBits = vpc.Bits()
+	}
+	if subnetBits > 29 {
+		return "", fmt.Errorf("VPC 网段 %s 没有可用的交换机子网", vpcCIDR)
+	}
+	used := make([]netip.Prefix, 0, len(usedCIDRs))
+	for _, raw := range usedCIDRs {
+		prefix, parseErr := netip.ParsePrefix(raw)
+		if parseErr == nil && prefix.Addr().Is4() {
+			used = append(used, prefix.Masked())
+		}
+	}
+	baseBytes := vpc.Addr().As4()
+	base := uint32(baseBytes[0])<<24 | uint32(baseBytes[1])<<16 | uint32(baseBytes[2])<<8 | uint32(baseBytes[3])
+	step := uint64(1) << uint(32-subnetBits)
+	count := uint64(1) << uint(subnetBits-vpc.Bits())
+	for index := uint64(0); index < count; index++ {
+		value := uint64(base) + index*step
+		candidate := netip.PrefixFrom(netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)}), subnetBits).Masked()
+		overlapped := false
+		for _, occupied := range used {
+			if candidate.Overlaps(occupied) {
+				overlapped = true
+				break
+			}
+		}
+		if !overlapped {
+			return candidate.String(), nil
+		}
+	}
+	return "", fmt.Errorf("VPC 网段 %s 中没有不重叠的交换机子网", vpcCIDR)
+}
+
+func isDuplicatePermission(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && strings.Contains(strings.ToLower(apiErr.Code), "duplicate")
+}
+
+func waitForNetworkResource(ctx context.Context, resource, id string, describe func() (string, error)) error {
+	const timeout = 30 * time.Second
+	const interval = 500 * time.Millisecond
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	var lastStatus string
+	for {
+		status, err := describe()
+		if err == nil {
+			lastStatus = status
+			if strings.EqualFold(status, "Available") {
+				return nil
+			}
+			if strings.EqualFold(status, "Failed") {
+				return fmt.Errorf("%s %s entered Failed status", resource, id)
+			}
+		} else if !IsNotFound(err) {
+			return fmt.Errorf("查询%s %s 状态失败: %w", resource, id, err)
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-deadline.C:
+			timer.Stop()
+			if lastStatus == "" {
+				lastStatus = "未返回"
+			}
+			return fmt.Errorf("等待%s %s 可用超时，最后状态: %s", resource, id, lastStatus)
+		case <-timer.C:
+		}
+	}
+}
+
+func firstNetworkResourceStatus(resources []map[string]any) string {
+	if len(resources) == 0 {
+		return ""
+	}
+	return firstString(resources[0], "Status", "status")
 }
 
 func (s *Service) CleanupNetwork(ctx context.Context, region, vpcID, vswitchID, securityGroupID string) error {
@@ -1105,6 +1514,18 @@ func diskOptionsFromResponse(root map[string]any) []map[string]any {
 		category := firstString(item, "Category", "Value", "Name")
 		add(category, firstInt(item, "MinSize", "MinSystemDiskSize", "Min"), firstInt(item, "MaxSize", "MaxSystemDiskSize", "Max"), item)
 	}
+	priority := map[string]int{"cloud_essd": 0, "cloud_auto": 1, "cloud_essd_entry": 2}
+	sort.SliceStable(options, func(i, j int) bool {
+		left, leftOK := priority[stringValue(options[i]["value"])]
+		right, rightOK := priority[stringValue(options[j]["value"])]
+		if !leftOK {
+			left = 100
+		}
+		if !rightOK {
+			right = 100
+		}
+		return left < right
+	})
 	return options
 }
 

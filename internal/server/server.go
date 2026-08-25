@@ -28,28 +28,30 @@ import (
 )
 
 type Server struct {
-	Store         *store.Store
-	Cloud         cloud.Client
-	CloudFactory  func(app.Account) cloud.Client
-	DataDir       string
-	Template      string
-	SetupToken    string
-	CookieSecure  bool
-	UpdateDir     string
-	Log           *log.Logger
-	mu            sync.Mutex
-	updateMu      sync.Mutex
-	previews      map[string]map[string]any
-	imageChecker  func(context.Context, string) (bool, string, error)
-	githubAPIBase string
+	Store          *store.Store
+	CloudFactory   func(app.Account) cloud.Client
+	DataDir        string
+	Template       string
+	CookieSecure   bool
+	UpdateDir      string
+	Log            *log.Logger
+	mu             sync.Mutex
+	inventoryMu    sync.Mutex
+	updateMu       sync.Mutex
+	previews       map[string]map[string]any
+	packageChecker func(githubRelease, string) bool
+	githubAPIBase  string
 }
 
-func New(st *store.Store, dataDir, templatePath, setupToken string, client cloud.Client) *Server {
-	if setupToken == "" {
-		setupToken = randomToken(24)
-		log.Printf("ECS_SETUP_TOKEN 未设置，本次初始化 token: %s", setupToken)
+func New(st *store.Store, dataDir, templatePath string) *Server {
+	return &Server{Store: st, DataDir: dataDir, Template: templatePath, Log: log.Default(), previews: map[string]map[string]any{}}
+}
+
+func (s *Server) cloudClient(account app.Account) cloud.Client {
+	if s.CloudFactory == nil {
+		return nil
 	}
-	return &Server{Store: st, DataDir: dataDir, Template: templatePath, SetupToken: setupToken, Cloud: client, Log: log.Default(), previews: map[string]map[string]any{}}
+	return s.CloudFactory(account)
 }
 
 type gzipResponseWriter struct {
@@ -197,16 +199,17 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		s.error(w, http.StatusForbidden, "系统已完成初始化")
 		return
 	}
-	if r.Header.Get("X-Setup-Token") != s.SetupToken {
-		s.error(w, http.StatusForbidden, "初始化 token 无效")
-		return
-	}
 	data, err := readJSON(r)
 	if err != nil {
 		s.error(w, 400, err.Error())
 		return
 	}
+	username := stringValue(data["admin_username"])
 	password := stringValue(data["admin_password"])
+	if err := store.ValidateAdminUsername(username); err != nil {
+		s.error(w, 400, err.Error())
+		return
+	}
 	if len(password) < 6 {
 		s.error(w, 400, "管理员密码至少需要 6 个字符")
 		return
@@ -216,7 +219,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		s.error(w, 400, "流量阈值必须在 1 到 100 之间")
 		return
 	}
-	if err := s.Store.SetAdminPassword(password); err != nil {
+	if err := s.Store.SetAdminCredentials(username, password); err != nil {
 		s.error(w, 500, "初始化失败")
 		return
 	}
@@ -244,9 +247,9 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		s.error(w, 400, err.Error())
 		return
 	}
-	if !s.Store.CheckAdminPassword(stringValue(data["password"])) {
+	if !s.Store.CheckAdminCredentials(stringValue(data["username"]), stringValue(data["password"])) {
 		s.Store.RecordLoginFailure(ip)
-		s.json(w, 200, map[string]any{"success": false, "message": "密码错误"})
+		s.json(w, 200, map[string]any{"success": false, "message": "用户名或密码错误"})
 		return
 	}
 	s.Store.ClearLoginFailures(ip)
@@ -344,12 +347,18 @@ func (s *Server) authenticatedAction(w http.ResponseWriter, r *http.Request, act
 		s.preview(w, r, data)
 	case "get_ecs_disk_options":
 		s.diskOptions(w, r, data)
+	case "get_ecs_images":
+		s.images(w, r, data)
 	case "create_ecs":
 		s.createTask(w, r, data)
 	case "get_ecs_create_task":
 		s.task(w, r)
+	case "get_instance_initial_credential":
+		s.instanceCredential(w, data)
 	case "control_instance":
 		s.control(w, data)
+	case "save_instance_schedule":
+		s.saveInstanceSchedule(w, data)
 	case "delete_instance":
 		s.deleteInstance(w, data)
 	case "replace_instance_ip":
@@ -386,6 +395,12 @@ func (s *Server) authenticatedAction(w http.ResponseWriter, r *http.Request, act
 func (s *Server) config(w http.ResponseWriter) {
 	settings := s.Store.Settings()
 	groups, _ := s.Store.LoadGroups()
+	rotationGroups, _ := s.Store.LoadRotationGroups()
+	for i := range rotationGroups {
+		rotationGroups[i].DNS.CloudflareToken = masked(rotationGroups[i].DNS.CloudflareToken)
+		rotationGroups[i].DNS.DNSPodSecretKey = masked(rotationGroups[i].DNS.DNSPodSecretKey)
+		rotationGroups[i].DNS.AliDNSSecret = masked(rotationGroups[i].DNS.AliDNSSecret)
+	}
 	accounts, _ := s.Store.LoadAccounts(false)
 	type metric struct {
 		used         float64
@@ -435,7 +450,7 @@ func (s *Server) config(w http.ResponseWriter) {
 			m.used = m.fallbackUsed
 		}
 	}
-	result := map[string]any{"admin_password": "********", "admin_password_set": s.Store.IsInitialized(), "password_login_enabled": settingBool(settings["password_login_enabled"], true), "passkey_count": s.Store.PasskeyCount(), "traffic_threshold": numberString(settings["traffic_threshold"], 95), "shutdown_mode": fallback(settings["shutdown_mode"], "KeepCharging"), "threshold_action": fallback(settings["threshold_action"], "stop_and_notify"), "keep_alive": settings["keep_alive"] == "1", "monthly_auto_start": settings["monthly_auto_start"] == "1", "api_interval": numberString(settings["api_interval"], 600), "enable_billing": settings["enable_billing"] == "1", "AppBrand": map[string]any{"logo_url": settings["app_logo_url"]}, "Notification": notificationSettings(settings), "Ddns": map[string]any{"enabled": settings["ddns_enabled"] == "1", "provider": fallback(settings["ddns_provider"], "cloudflare"), "domain": settings["ddns_domain"], "cloudflare": map[string]any{"zone_id": settings["ddns_cf_zone_id"], "token": masked(settings["ddns_cf_token"]), "proxied": settings["ddns_cf_proxied"] == "1"}}, "Accounts": []any{}}
+	result := map[string]any{"admin_username": settings["admin_username"], "admin_password": "********", "admin_password_set": s.Store.IsInitialized(), "password_login_enabled": settingBool(settings["password_login_enabled"], true), "passkey_count": s.Store.PasskeyCount(), "traffic_threshold": numberString(settings["traffic_threshold"], 95), "shutdown_mode": fallback(settings["shutdown_mode"], "KeepCharging"), "threshold_action": fallback(settings["threshold_action"], "stop_and_notify"), "keep_alive": settings["keep_alive"] == "1", "monthly_auto_start": settings["monthly_auto_start"] == "1", "api_interval": numberString(settings["api_interval"], 600), "inventory_sync_enabled": settingBool(settings["inventory_sync_enabled"], true), "inventory_sync_interval": numberString(settings["inventory_sync_interval"], 3600), "enable_billing": settings["enable_billing"] == "1", "AppBrand": map[string]any{"logo_url": settings["app_logo_url"]}, "Notification": notificationSettings(settings), "RotationGroups": rotationGroups, "Accounts": []any{}}
 	items := result["Accounts"].([]any)
 	for _, g := range groups {
 		m := metrics[g.GroupKey]
@@ -495,7 +510,7 @@ func (s *Server) config(w http.ResponseWriter) {
 		if g.MaxTraffic > 0 {
 			usagePercent = used / g.MaxTraffic * 100
 		}
-		items = append(items, map[string]any{"AccessKeyId": g.AccessKeyID, "AccessKeySecret": "********", "AccessKeySecretSet": g.AccessKeySecret != "", "regionId": g.RegionID, "maxTraffic": g.MaxTraffic, "remark": g.Remark, "siteType": g.SiteType, "groupKey": g.GroupKey, "scheduleEnabled": g.ScheduleEnabled, "scheduleStartEnabled": g.ScheduleStartEnabled, "scheduleStopEnabled": g.ScheduleStopEnabled, "startTime": g.StartTime, "stopTime": g.StopTime, "scheduleBlockedByTraffic": g.ScheduleBlockedByTraffic, "usageUsed": used, "usageRemaining": maxFloat(g.MaxTraffic-used, 0), "usagePercent": usagePercent, "instanceCount": count, "usageLastUpdated": time.Unix(updated, 0).Format("2006-01-02 15:04:05"), "trafficStatus": trafficStatus, "trafficMessage": trafficMessage, "trafficScope": scope, "billing": billing})
+		items = append(items, map[string]any{"AccessKeyId": g.AccessKeyID, "AccessKeySecret": "********", "AccessKeySecretSet": g.AccessKeySecret != "", "regionId": g.RegionID, "maxTraffic": g.MaxTraffic, "remark": g.Remark, "siteType": g.SiteType, "groupKey": g.GroupKey, "scheduleBlockedByTraffic": g.ScheduleBlockedByTraffic, "usageUsed": used, "usageRemaining": maxFloat(g.MaxTraffic-used, 0), "usagePercent": usagePercent, "instanceCount": count, "usageLastUpdated": time.Unix(updated, 0).Format("2006-01-02 15:04:05"), "trafficStatus": trafficStatus, "trafficMessage": trafficMessage, "trafficScope": scope, "billing": billing})
 	}
 	result["Accounts"] = items
 	s.json(w, 200, result)
@@ -506,10 +521,7 @@ func (s *Server) getCachedCDTTraffic(group app.AccountGroup, accountID int64, cy
 	if cached, ok := s.Store.GetBillingCache(accountID, "cdt_traffic", cycle, cacheAge); ok {
 		return numberFloat(cached["traffic"]), true
 	}
-	client := s.Cloud
-	if s.CloudFactory != nil {
-		client = s.CloudFactory(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
-	}
+	client := s.cloudClient(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
 	if client == nil {
 		return 0, false
 	}
@@ -583,15 +595,12 @@ func (s *Server) billDetails(w http.ResponseWriter, r *http.Request, data map[st
 		group.SiteType = groupAccounts[0].SiteType
 	}
 
-	client := s.Cloud
-	if s.CloudFactory != nil {
-		client = s.CloudFactory(app.Account{
-			AccessKeyID:     group.AccessKeyID,
-			AccessKeySecret: group.AccessKeySecret,
-			RegionID:        group.RegionID,
-			SiteType:        group.SiteType,
-		})
-	}
+	client := s.cloudClient(app.Account{
+		AccessKeyID:     group.AccessKeyID,
+		AccessKeySecret: group.AccessKeySecret,
+		RegionID:        group.RegionID,
+		SiteType:        group.SiteType,
+	})
 	detailClient, ok := client.(cloud.BillingDetailClient)
 	if !ok {
 		s.error(w, http.StatusServiceUnavailable, "当前云客户端不支持账单明细")
@@ -732,6 +741,7 @@ func laterTimestamp(current, candidate string) string {
 
 func (s *Server) status(w http.ResponseWriter) {
 	accounts, _ := s.Store.LoadAccounts(false)
+	credentialInstances, _ := s.Store.CredentialTaskInstances()
 	data := make([]map[string]any, 0)
 	for _, a := range accounts {
 		if a.InstanceID == "" {
@@ -745,7 +755,7 @@ func (s *Server) status(w http.ResponseWriter) {
 		if label == "" {
 			label = a.AccessKeyID
 		}
-		data = append(data, map[string]any{"id": a.ID, "accountId": a.ID, "instanceId": a.InstanceID, "instanceName": a.InstanceName, "instanceType": a.InstanceType, "cpu": a.CPU, "memory": a.Memory, "osName": a.OSName, "region": a.RegionID, "regionId": a.RegionID, "regionName": a.RegionID, "status": a.InstanceStatus, "instanceStatus": a.InstanceStatus, "publicIp": a.PublicIP, "privateIp": a.PrivateIP, "trafficUsed": a.TrafficUsed, "flow_used": a.TrafficUsed, "flow_total": a.MaxTraffic, "percentageOfUse": percent, "rate95": percent >= float64(numberString(s.Store.GetSetting("traffic_threshold", ""), 95)), "maxTraffic": a.MaxTraffic, "remark": a.Remark, "accountLabel": label + " / " + a.RegionID, "groupKey": a.GroupKey, "healthStatus": a.HealthStatus, "trafficStatus": a.TrafficAPIStatus, "trafficMessage": a.TrafficAPIMessage, "trafficScope": trafficScope(a.TrafficAPIStatus), "internetMaxBandwidthOut": a.InternetBandwidth, "publicIpMode": a.PublicIPMode, "eipAllocationId": a.EIPAllocationID, "eipAddress": a.EIPAddress, "eipManaged": a.EIPManaged, "operationLocked": a.IsDeleted == 1})
+		data = append(data, map[string]any{"id": a.ID, "accountId": a.ID, "instanceId": a.InstanceID, "instanceName": a.InstanceName, "instanceType": a.InstanceType, "cpu": a.CPU, "memory": a.Memory, "osName": a.OSName, "region": a.RegionID, "regionId": a.RegionID, "regionName": a.RegionID, "status": a.InstanceStatus, "instanceStatus": a.InstanceStatus, "publicIp": a.PublicIP, "privateIp": a.PrivateIP, "trafficUsed": a.TrafficUsed, "flow_used": a.TrafficUsed, "flow_total": a.MaxTraffic, "percentageOfUse": percent, "rate95": percent >= float64(numberString(s.Store.GetSetting("traffic_threshold", ""), 95)), "maxTraffic": a.MaxTraffic, "remark": a.Remark, "accountLabel": label + " / " + a.RegionID, "groupKey": a.GroupKey, "healthStatus": a.HealthStatus, "trafficStatus": a.TrafficAPIStatus, "trafficMessage": a.TrafficAPIMessage, "trafficScope": trafficScope(a.TrafficAPIStatus), "internetMaxBandwidthOut": a.InternetBandwidth, "publicIpMode": a.PublicIPMode, "eipAllocationId": a.EIPAllocationID, "eipAddress": a.EIPAddress, "eipManaged": a.EIPManaged, "hasInitialCredential": credentialInstances[a.InstanceID], "operationLocked": a.IsDeleted == 1, "scheduleEnabled": a.ScheduleEnabled, "scheduleStartEnabled": a.ScheduleStartEnabled, "scheduleStopEnabled": a.ScheduleStopEnabled, "startTime": a.StartTime, "stopTime": a.StopTime, "stoppedMode": a.StoppedMode, "scheduleBlockedByTraffic": a.ScheduleBlockedByTraffic})
 	}
 	s.json(w, 200, map[string]any{"data": data, "system_last_run": s.Store.LastRun(), "sync_interval": numberString(s.Store.GetSetting("api_interval", ""), 600), "sensitive_visible": true})
 }
@@ -771,6 +781,14 @@ func (s *Server) saveConfig(data map[string]any) error {
 	if interval < 30 || interval > 86400 {
 		return fmt.Errorf("API 间隔必须在 30 到 86400 秒之间")
 	}
+	inventoryInterval := number(data["inventory_sync_interval"], 3600)
+	if inventoryInterval < 1800 || inventoryInterval > 86400 {
+		return fmt.Errorf("账号清单同步间隔必须在 1800 到 86400 秒之间")
+	}
+	inventoryEnabled := settingBool(s.Store.GetSetting("inventory_sync_enabled", ""), true)
+	if _, exists := data["inventory_sync_enabled"]; exists {
+		inventoryEnabled = truthy(data["inventory_sync_enabled"])
+	}
 	passwordLoginEnabled := settingBool(s.Store.GetSetting("password_login_enabled", ""), true)
 	if _, exists := data["password_login_enabled"]; exists {
 		passwordLoginEnabled = truthy(data["password_login_enabled"])
@@ -778,12 +796,17 @@ func (s *Server) saveConfig(data map[string]any) error {
 	if !passwordLoginEnabled && s.Store.PasskeyCount() == 0 {
 		return fmt.Errorf("关闭密码登录前请先设置至少一个 Passkey")
 	}
+	if username := stringValue(data["admin_username"]); username != "" && username != s.Store.GetSetting("admin_username", "") {
+		if err := s.Store.SetAdminUsername(username); err != nil {
+			return err
+		}
+	}
 	if password := stringValue(data["admin_password"]); password != "" && password != "********" {
 		if err := s.Store.SetAdminPassword(password); err != nil {
 			return err
 		}
 	}
-	for key, value := range map[string]any{"traffic_threshold": threshold, "shutdown_mode": fallback(stringValue(data["shutdown_mode"]), "KeepCharging"), "threshold_action": fallback(stringValue(data["threshold_action"]), "stop_and_notify"), "keep_alive": bool01(data["keep_alive"]), "monthly_auto_start": bool01(data["monthly_auto_start"]), "api_interval": interval, "enable_billing": bool01(data["enable_billing"]), "password_login_enabled": bool01(passwordLoginEnabled)} {
+	for key, value := range map[string]any{"traffic_threshold": threshold, "shutdown_mode": fallback(stringValue(data["shutdown_mode"]), "KeepCharging"), "threshold_action": fallback(stringValue(data["threshold_action"]), "stop_and_notify"), "keep_alive": bool01(data["keep_alive"]), "monthly_auto_start": bool01(data["monthly_auto_start"]), "api_interval": interval, "inventory_sync_enabled": bool01(inventoryEnabled), "inventory_sync_interval": inventoryInterval, "enable_billing": bool01(data["enable_billing"]), "password_login_enabled": bool01(passwordLoginEnabled)} {
 		if err := s.Store.SetSetting(key, fmt.Sprint(value)); err != nil {
 			return err
 		}
@@ -791,16 +814,25 @@ func (s *Server) saveConfig(data map[string]any) error {
 	if brand, ok := data["AppBrand"].(map[string]any); ok {
 		_ = s.Store.SetSetting("app_logo_url", stringValue(brand["logo_url"]))
 	}
-	if ddns, ok := data["Ddns"].(map[string]any); ok {
-		_ = s.Store.SetSetting("ddns_enabled", bool01(ddns["enabled"]))
-		_ = s.Store.SetSetting("ddns_provider", stringValue(ddns["provider"]))
-		_ = s.Store.SetSetting("ddns_domain", stringValue(ddns["domain"]))
-		if cf, ok := ddns["cloudflare"].(map[string]any); ok {
-			_ = s.Store.SetSetting("ddns_cf_zone_id", stringValue(cf["zone_id"]))
-			_ = s.Store.SetSetting("ddns_cf_proxied", bool01(cf["proxied"]))
-			if err := s.saveSecret("ddns_cf_token", stringValue(cf["token"])); err != nil {
-				return err
+	if raw, exists := data["RotationGroups"]; exists {
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return fmt.Errorf("分组配置无效")
+		}
+		var rotationGroups []app.RotationGroup
+		if err := json.Unmarshal(encoded, &rotationGroups); err != nil {
+			return fmt.Errorf("分组配置无效")
+		}
+		for i := range rotationGroups {
+			if rotationGroups[i].ID == "" {
+				rotationGroups[i].ID = randomToken(9)
 			}
+		}
+		if err := s.validateRotationGroups(rotationGroups); err != nil {
+			return err
+		}
+		if err := s.Store.SaveRotationGroups(rotationGroups); err != nil {
+			return err
 		}
 	}
 	if notify, ok := data["Notification"].(map[string]any); ok {
@@ -865,27 +897,15 @@ func (s *Server) saveConfig(data map[string]any) error {
 		if err != nil {
 			return err
 		}
-		beforeAccounts, _ := s.Store.LoadAccounts(false)
-		removedAccounts, err := s.Store.RemoveAccountsOutsideGroups(groups)
+		_, err = s.Store.RemoveAccountsOutsideGroups(groups)
 		if err != nil {
 			return err
-		}
-		for _, account := range removedAccounts {
-			if s.Store.GetSetting("ddns_enabled", "0") != "1" {
-				break
-			}
-			_ = s.Store.EnqueueJob(randomToken(16), "delete_ddns", strconv.FormatInt(account.ID, 10), map[string]any{"account": ddnsPayloadAccount(account), "before": ddnsPayloadAccounts(beforeAccounts)})
-		}
-		if s.Store.GetSetting("ddns_enabled", "0") == "1" {
-			// The monitor will reconcile current records and remove stale names
-			// on its next pass after a configuration change.
-			_ = s.Store.SetSetting("last_ddns_reconcile", "0")
 		}
 		for _, group := range groups {
 			if err := s.Store.ApplyGroupSettings(group); err != nil {
 				return err
 			}
-			if s.Cloud != nil || s.CloudFactory != nil {
+			if s.CloudFactory != nil {
 				if _, syncErr := s.syncGroup(group.GroupKey); syncErr != nil {
 					s.Store.AddLog("warning", "账号组同步失败: "+syncErr.Error())
 				}
@@ -920,16 +940,113 @@ func validateAccountRegionUniqueness(raw []any) error {
 	return nil
 }
 
-func ddnsPayloadAccount(account app.Account) map[string]any {
-	return map[string]any{"GroupKey": account.GroupKey, "AccessKeyID": account.AccessKeyID, "RegionID": account.RegionID, "InstanceID": account.InstanceID, "Remark": account.Remark, "InstanceName": account.InstanceName}
+func (s *Server) validateRotationGroups(groups []app.RotationGroup) error {
+	existing, _ := s.Store.LoadRotationGroups()
+	existingByID := make(map[string]app.RotationGroup, len(existing))
+	for _, group := range existing {
+		existingByID[group.ID] = group
+	}
+	groupIDs := map[string]bool{}
+	names := map[string]bool{}
+	domains := map[string]bool{}
+	members := map[int64]string{}
+	accounts, _ := s.Store.LoadAccounts(false)
+	availableAccounts := make(map[int64]app.Account, len(accounts))
+	for _, account := range accounts {
+		availableAccounts[account.ID] = account
+	}
+	for i := range groups {
+		group := &groups[i]
+		group.ID = strings.TrimSpace(group.ID)
+		group.Name = strings.TrimSpace(group.Name)
+		group.Domain = strings.ToLower(strings.Trim(strings.TrimSpace(group.Domain), "."))
+		group.Provider = strings.ToLower(strings.TrimSpace(group.Provider))
+		if group.ID == "" || groupIDs[group.ID] {
+			return fmt.Errorf("分组标识无效或重复")
+		}
+		groupIDs[group.ID] = true
+		if group.Name == "" {
+			return fmt.Errorf("请填写分组名称")
+		}
+		nameKey := strings.ToLower(group.Name)
+		if names[nameKey] {
+			return fmt.Errorf("分组名称不能重复")
+		}
+		names[nameKey] = true
+		if !validDNSName(group.Domain) || domains[group.Domain] {
+			return fmt.Errorf("共享域名无效或已被其他分组使用")
+		}
+		domains[group.Domain] = true
+		if group.Provider != "cloudflare" && group.Provider != "dnspod" && group.Provider != "alidns" {
+			return fmt.Errorf("请选择有效的 DNS 服务商")
+		}
+		if group.AdvanceStartMinutes < 0 || group.AdvanceStartMinutes > 1440 || group.DelayStopMinutes < 0 || group.DelayStopMinutes > 1440 {
+			return fmt.Errorf("提前开机和延后关机必须在 0 到 1440 分钟之间")
+		}
+		if group.DNS.TTL == 0 {
+			group.DNS.TTL = 600
+		}
+		if group.DNS.TTL < 60 || group.DNS.TTL > 86400 {
+			return fmt.Errorf("DNS TTL 必须在 60 到 86400 秒之间")
+		}
+		previous := existingByID[group.ID]
+		switch group.Provider {
+		case "cloudflare":
+			if secretMissing(group.DNS.CloudflareToken, previous.DNS.CloudflareToken) {
+				return fmt.Errorf("请填写 Cloudflare API Token")
+			}
+		case "dnspod":
+			if strings.TrimSpace(group.DNS.DNSPodSecretID) == "" || secretMissing(group.DNS.DNSPodSecretKey, previous.DNS.DNSPodSecretKey) {
+				return fmt.Errorf("请填写 DNSPod SecretId 和 SecretKey")
+			}
+		case "alidns":
+			if strings.TrimSpace(group.DNS.AliDNSAccessKeyID) == "" || secretMissing(group.DNS.AliDNSSecret, previous.DNS.AliDNSSecret) {
+				return fmt.Errorf("请填写阿里云 DNS AccessKey ID 和 Secret")
+			}
+		}
+		for _, member := range group.Members {
+			account, exists := availableAccounts[member.AccountID]
+			if member.AccountID <= 0 || !exists {
+				return fmt.Errorf("分组成员实例无效")
+			}
+			if owner := members[member.AccountID]; owner != "" {
+				return fmt.Errorf("同一实例不能同时加入多个分组")
+			}
+			members[member.AccountID] = group.ID
+			if !account.ScheduleEnabled || !account.ScheduleStartEnabled || !account.ScheduleStopEnabled || !validClock(account.StartTime) || !validClock(account.StopTime) || account.StartTime == account.StopTime {
+				return fmt.Errorf("请先在实例管理中设置每台分组机器的正常开机和关机时间")
+			}
+		}
+	}
+	return nil
 }
 
-func ddnsPayloadAccounts(accounts []app.Account) []map[string]any {
-	result := make([]map[string]any, 0, len(accounts))
-	for _, account := range accounts {
-		result = append(result, ddnsPayloadAccount(account))
+func secretMissing(value, existing string) bool {
+	value = strings.TrimSpace(value)
+	return (value == "" || value == "********") && strings.TrimSpace(existing) == ""
+}
+
+func validClock(value string) bool {
+	_, err := time.Parse("15:04", strings.TrimSpace(value))
+	return err == nil
+}
+
+func validDNSName(value string) bool {
+	if len(value) < 3 || len(value) > 253 || !strings.Contains(value, ".") {
+		return false
 	}
-	return result
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string]any) {
@@ -942,6 +1059,22 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string
 	instanceType := stringValue(data["instanceType"])
 	if instanceType == "" {
 		instanceType = "ecs.e-c4m1.large"
+	}
+	billingMode := stringValue(data["billingMode"])
+	if billingMode == "" {
+		billingMode = cloud.BillingModePostpaid
+	}
+	if billingMode != cloud.BillingModePostpaid && billingMode != cloud.BillingModeSpot {
+		s.error(w, 400, "实例计费类型无效")
+		return
+	}
+	imageSource := stringValue(data["imageSource"])
+	if imageSource == "" {
+		imageSource = "system"
+	}
+	if imageSource != "system" && imageSource != "custom" {
+		s.error(w, 400, "镜像来源无效")
+		return
 	}
 	groups, _ := s.Store.LoadGroups()
 	var group *app.AccountGroup
@@ -975,6 +1108,23 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string
 		s.error(w, 400, "公网 IP 类型无效")
 		return
 	}
+	scheduleEnabled := truthy(data["scheduleEnabled"])
+	startTime := strings.TrimSpace(stringValue(data["startTime"]))
+	stopTime := strings.TrimSpace(stringValue(data["stopTime"]))
+	if scheduleEnabled && (!validClock(startTime) || !validClock(stopTime) || startTime == stopTime) {
+		s.error(w, 400, "请填写不同的正常开机和关机时间")
+		return
+	}
+	stoppedMode := stringValue(data["stoppedMode"])
+	if stoppedMode == "" {
+		stoppedMode = s.Store.GetSetting("shutdown_mode", "KeepCharging")
+	}
+	if stoppedMode != "KeepCharging" && stoppedMode != "StopCharging" {
+		s.error(w, 400, "停机模式无效")
+		return
+	}
+	// 创建 ECS 不再负责轮转关系；机器只能在分组管理中关联。
+	delete(data, "rotationGroupId")
 	loginPort := loginPortForOS(osKey)
 	name := stringValue(data["instanceName"])
 	if name == "" {
@@ -982,7 +1132,7 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string
 	}
 	diskCategory := stringValue(data["systemDiskCategory"])
 	if diskCategory == "" {
-		diskCategory = "cloud_essd_entry"
+		diskCategory = "cloud_essd"
 	}
 	diskSize := number(data["systemDiskSize"], 20)
 	bandwidth := number(data["internetMaxBandwidthOut"], 10)
@@ -992,8 +1142,9 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string
 	if bandwidth < 1 {
 		bandwidth = 1
 	}
-	data["accountGroupKey"], data["regionId"], data["instanceType"], data["osKey"] = groupKey, regionID, instanceType, osKey
-	data["instanceName"], data["publicIpMode"], data["systemDiskCategory"], data["systemDiskSize"], data["internetMaxBandwidthOut"] = name, publicMode, diskCategory, diskSize, bandwidth
+	data["accountGroupKey"], data["regionId"], data["instanceType"], data["osKey"], data["imageSource"] = groupKey, regionID, instanceType, osKey, imageSource
+	data["instanceName"], data["publicIpMode"], data["billingMode"], data["systemDiskCategory"], data["systemDiskSize"], data["internetMaxBandwidthOut"] = name, publicMode, billingMode, diskCategory, diskSize, bandwidth
+	data["scheduleEnabled"], data["startTime"], data["stopTime"], data["stoppedMode"] = scheduleEnabled, startTime, stopTime, stoppedMode
 	data["loginPort"] = loginPort
 	data["loginUser"] = loginUser(osKey)
 	if stringValue(data["zoneId"]) == "" {
@@ -1015,11 +1166,13 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string
 		return
 	}
 	osLabel, imageID := osInfo(osKey)
-	warnings := []any{"Go 版本已改为异步创建；请确认安全组来源和按量费用后继续"}
-	previewClient := s.Cloud
-	if s.CloudFactory != nil {
-		previewClient = s.CloudFactory(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
+	var selectedImage map[string]any
+	var selectedCustomImage map[string]any
+	warnings := []any{"Go 版本已改为异步创建；请确认安全组规则和费用后继续"}
+	if billingMode == cloud.BillingModeSpot {
+		warnings = append(warnings, "抢占式实例可能因市场价格或资源供需变化被阿里云主动回收，业务需能够容忍中断")
 	}
+	previewClient := s.cloudClient(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
 	if previewClient != nil {
 		preflight, ok := previewClient.(cloud.PreflightClient)
 		if !ok {
@@ -1032,7 +1185,7 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string
 			return
 		}
 		architecture := normalizeArchitecture(stringValue(typeInfo["CpuArchitecture"]))
-		zones, zoneErr := preflight.DescribeAvailableZones(r.Context(), regionID, instanceType, diskCategory)
+		zones, zoneErr := preflight.DescribeAvailableZones(r.Context(), regionID, instanceType, diskCategory, billingMode)
 		if zoneErr != nil || len(zones) == 0 {
 			if zoneErr == nil {
 				zoneErr = fmt.Errorf("没有可用区库存")
@@ -1042,11 +1195,8 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string
 		}
 		requestedZone := stringValue(data["zoneId"])
 		zoneWasRequested := requestedZone != "" && requestedZone != "待由云 API 选择"
-		if requestedZone == "" || requestedZone == "待由云 API 选择" {
-			requestedZone = firstMapString(zones, "ZoneId", "zoneId")
-		}
-		if requestedZone == "" {
-			s.error(w, 400, "云 API 未返回可用区")
+		if !zoneWasRequested {
+			s.error(w, 400, "请选择可用区")
 			return
 		}
 		if zoneWasRequested && !containsMapValue(zones, requestedZone, "ZoneId", "zoneId") {
@@ -1054,45 +1204,77 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string
 			return
 		}
 		data["zoneId"] = requestedZone
-		var images []map[string]any
-		var imageErr error
-		if imageProvider, ok := previewClient.(interface {
-			DescribeImagesForArchitecture(context.Context, string, string, string) ([]map[string]any, error)
-		}); ok {
-			images, imageErr = imageProvider.DescribeImagesForArchitecture(r.Context(), regionID, osKey, architecture)
-		} else {
-			imageProvider, imageOK := previewClient.(interface {
-				DescribeImages(context.Context, string, string) ([]map[string]any, error)
-			})
-			if imageOK {
-				images, imageErr = imageProvider.DescribeImages(r.Context(), regionID, osKey)
-			} else {
-				imageErr = fmt.Errorf("云客户端不支持镜像查询")
+		if imageSource == "custom" {
+			images, imageErr := preflight.DescribeCustomImages(r.Context(), regionID, architecture)
+			if imageErr != nil {
+				s.error(w, 400, "自定义镜像预检失败: "+imageErr.Error())
+				return
 			}
-		}
-		if imageErr != nil || len(images) == 0 {
-			if imageErr == nil {
-				imageErr = fmt.Errorf("未找到匹配的可用系统镜像")
+			requestedImageID := strings.TrimSpace(stringValue(data["imageId"]))
+			if requestedImageID == "" {
+				requestedImageID = firstMapString(images, "ImageId", "imageId")
 			}
-			s.error(w, 400, "系统镜像预检失败: "+imageErr.Error())
-			return
-		}
-		if explicitImage := stringValue(data["imageId"]); explicitImage != "" {
-			imageID = explicitImage
+			for _, image := range images {
+				if stringValue(image["ImageId"]) == requestedImageID {
+					selectedCustomImage = image
+					break
+				}
+			}
+			if selectedCustomImage == nil {
+				s.error(w, 400, "所选自定义镜像不存在、不可用或与实例架构不匹配")
+				return
+			}
+			selectedImage = selectedCustomImage
+			imageID = requestedImageID
+			osKey = ecsImageOSKey(selectedCustomImage)
+			osLabel = ecsImageLabel(selectedCustomImage)
 		} else {
-			imageID = firstMapString(images, "ImageId", "imageId")
+			images, imageErr := preflight.DescribeImagesForArchitecture(r.Context(), regionID, "", architecture)
+			if imageErr != nil || len(images) == 0 {
+				if imageErr == nil {
+					imageErr = fmt.Errorf("未找到匹配的可用系统镜像")
+				}
+				s.error(w, 400, "系统镜像预检失败: "+imageErr.Error())
+				return
+			}
+			requestedImageID := strings.TrimSpace(stringValue(data["imageId"]))
+			if requestedImageID == "" {
+				requestedImageID = firstMapString(images, "ImageId", "imageId")
+			}
+			for _, image := range images {
+				if stringValue(image["ImageId"]) == requestedImageID {
+					selectedImage = image
+					break
+				}
+			}
+			if selectedImage == nil {
+				s.error(w, 400, "所选内置镜像不存在、不可用或与实例架构不匹配")
+				return
+			}
+			imageID = requestedImageID
 		}
 		if imageID == "" {
 			s.error(w, 400, "镜像预检未返回 ImageId")
 			return
 		}
-		if options, diskErr := preflight.GetSystemDiskOptions(r.Context(), regionID, requestedZone, instanceType); diskErr != nil {
+		loginPort = loginPortForOS(osKey)
+		data["osKey"], data["loginPort"], data["loginUser"] = osKey, loginPort, loginUser(osKey)
+		if userData, systemName := ecsImageCloudInitUserData(selectedCustomImage); userData != "" {
+			data["cloudInitUserData"] = userData
+			warnings = append(warnings, fmt.Sprintf("%s 自定义镜像将通过 cloud-init 启用 root SSH 密码登录", systemName))
+		} else {
+			delete(data, "cloudInitUserData")
+		}
+		if options, diskErr := preflight.GetSystemDiskOptions(r.Context(), regionID, requestedZone, instanceType, billingMode, imageID); diskErr != nil {
 			s.error(w, 400, "系统盘预检失败: "+diskErr.Error())
 			return
 		} else if len(options) > 0 {
 			selected := selectDiskOption(options, diskCategory)
 			diskCategory = stringValue(selected["value"])
 			minSize, maxSize := number(selected["min"], 20), number(selected["max"], 32768)
+			if selectedCustomImage != nil {
+				minSize = ecsCustomImageDiskMinSize(diskCategory, minSize, ecsImageMinDiskSize(selectedCustomImage))
+			}
 			if diskSize < minSize {
 				diskSize = minSize
 			}
@@ -1108,16 +1290,40 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request, data map[string
 		imageID = stringValue(data["imageId"])
 	}
 	data["zoneId"], data["imageId"], data["systemDiskCategory"], data["systemDiskSize"] = stringValue(data["zoneId"]), imageID, diskCategory, diskSize
+	pricing := any(map[string]any{"available": false, "message": "云客户端未配置，无法获取实时价格"})
+	if previewClient != nil {
+		priceClient, ok := previewClient.(cloud.CreatePriceClient)
+		if !ok {
+			s.error(w, 503, "当前云客户端不支持 ECS 价格预估")
+			return
+		}
+		estimate, priceErr := priceClient.EstimateCreatePrice(r.Context(), cloud.CreatePriceRequest{RegionID: regionID, ZoneID: stringValue(data["zoneId"]), InstanceType: instanceType, ImageID: imageID, DiskCategory: diskCategory, DiskSize: diskSize, PublicIPMode: publicMode, BillingMode: billingMode, BandwidthMbps: bandwidth})
+		if priceErr != nil {
+			s.error(w, 400, "费用预估失败: "+priceErr.Error())
+			return
+		}
+		if stoppedMode == "StopCharging" {
+			estimate.EstimationNote = "30 天按连续运行 720 小时展示固定资源上限；节省停机时计算资源（CPU 和内存）、镜像 License 费用、固定公网 IP 的固定带宽模式暂停计费，系统盘、数据盘、弹性公网 IP（EIP）的固定带宽模式持续计费。"
+		}
+		pricing = estimate
+	}
 	data["_previewCreatedAt"] = time.Now().Unix()
 	s.mu.Lock()
 	s.previews[id] = data
 	s.mu.Unlock()
 	minDisk, maxDisk := number(data["systemDiskMin"], 20), number(data["systemDiskMax"], 32768)
-	summary := map[string]any{"account": map[string]any{"label": group.Remark, "groupKey": group.GroupKey, "accessKeyId": maskAccessKey(group.AccessKeyID)}, "regionId": data["regionId"], "zoneId": data["zoneId"], "instanceType": instanceType, "instanceName": name, "osKey": osKey, "osLabel": osLabel, "imageId": imageID, "loginUser": loginUser(osKey), "loginPort": loginPort, "clientCidrIp": data["clientCidrIp"], "systemDisk": map[string]any{"category": diskCategory, "size": diskSize, "min": minDisk, "max": maxDisk, "unit": "GB"}, "network": map[string]any{"vpc": map[string]any{"name": "ecs-controller", "cidr": "192.168.0.0/16"}, "vswitch": map[string]any{"name": "ecs-controller", "cidr": "192.168.0.0/24"}, "securityGroup": map[string]any{"name": "ecs-controller", "cidr": stringValue(data["clientCidrIp"]), "rules": []string{fmt.Sprintf("TCP %d / %s", loginPort, stringValue(data["clientCidrIp"]))}}}, "internetMaxBandwidthOut": bandwidth, "publicIpMode": publicMode, "publicIpModeLabel": map[string]string{"eip": "EIP 弹性公网 IP", "ecs_public_ip": "ECS 普通公网 IP"}[publicMode], "accountGroupKey": groupKey}
+	securityGroupCIDR := stringValue(data["clientCidrIp"])
+	securityGroupRules := []string{fmt.Sprintf("TCP %d / %s", loginPort, securityGroupCIDR)}
+	if !strings.HasPrefix(strings.ToLower(osKey), "windows") {
+		securityGroupCIDR = "0.0.0.0/0"
+		securityGroupRules = []string{"所有协议 / 所有端口 / 0.0.0.0/0"}
+		warnings = append(warnings, "Linux 安全组将向公网放行所有协议和所有端口；创建后请按需收紧规则")
+	}
+	summary := map[string]any{"account": map[string]any{"label": group.Remark, "groupKey": group.GroupKey, "accessKeyId": maskAccessKey(group.AccessKeyID)}, "regionId": data["regionId"], "zoneId": data["zoneId"], "instanceType": instanceType, "instanceName": name, "osKey": osKey, "osLabel": osLabel, "imageId": imageID, "imageSource": imageSource, "imageSourceLabel": map[string]string{"system": "项目内置镜像", "custom": "账号自定义镜像"}[imageSource], "cloudInitEnabled": stringValue(data["cloudInitUserData"]) != "", "loginUser": loginUser(osKey), "loginPort": loginPort, "clientCidrIp": data["clientCidrIp"], "systemDisk": map[string]any{"category": diskCategory, "size": diskSize, "min": minDisk, "max": maxDisk, "unit": "GB"}, "network": map[string]any{"vpc": map[string]any{"name": "ecs-controller", "cidr": "192.168.0.0/16"}, "vswitch": map[string]any{"name": "ecs-controller", "cidr": "自动选择不重叠网段"}, "securityGroup": map[string]any{"name": "ecs-controller", "cidr": securityGroupCIDR, "rules": securityGroupRules}}, "internetMaxBandwidthOut": bandwidth, "publicIpMode": publicMode, "publicIpModeLabel": map[string]string{"eip": "不分配公网 IP（自行绑定 EIP）", "ecs_public_ip": "ECS 普通公网 IP"}[publicMode], "billingMode": billingMode, "billingModeLabel": map[string]string{cloud.BillingModePostpaid: "普通按量", cloud.BillingModeSpot: "抢占式（市场价）"}[billingMode], "accountGroupKey": groupKey, "scheduleEnabled": scheduleEnabled, "startTime": startTime, "stopTime": stopTime, "stoppedMode": stoppedMode, "stoppedModeLabel": map[string]string{"KeepCharging": "普通停机", "StopCharging": "节省停机（原停机不收费）"}[stoppedMode]}
 	if summary["publicIpModeLabel"] == "" {
 		summary["publicIpModeLabel"] = publicMode
 	}
-	s.json(w, 200, map[string]any{"success": true, "previewId": id, "summary": summary, "pricing": map[string]any{"message": "价格预览需接入 BSS 预估 API，最终费用以阿里云账单为准"}, "warnings": warnings})
+	s.json(w, 200, map[string]any{"success": true, "previewId": id, "summary": summary, "pricing": pricing, "warnings": warnings})
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request, data map[string]any) {
@@ -1165,6 +1371,89 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request, data map[str
 	s.json(w, 202, map[string]any{"success": true, "queued": true, "taskId": taskID, "data": map[string]any{"task_id": taskID, "status": "queued"}})
 }
 
+func (s *Server) images(w http.ResponseWriter, r *http.Request, data map[string]any) {
+	groupKey := stringValue(data["accountGroupKey"])
+	groups, _ := s.Store.LoadGroups()
+	var group *app.AccountGroup
+	for i := range groups {
+		if groups[i].GroupKey == groupKey {
+			group = &groups[i]
+			break
+		}
+	}
+	if group == nil {
+		s.error(w, 400, "账号组不存在")
+		return
+	}
+	regionID := stringValue(data["regionId"])
+	if regionID == "" {
+		regionID = group.RegionID
+	}
+	instanceType := stringValue(data["instanceType"])
+	if instanceType == "" {
+		instanceType = "ecs.e-c4m1.large"
+	}
+	client := s.cloudClient(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
+	if client == nil {
+		s.json(w, 200, map[string]any{"success": true, "data": map[string]any{"options": []any{}, "regionId": regionID, "architecture": ""}})
+		return
+	}
+	preflight, ok := client.(cloud.PreflightClient)
+	if !ok {
+		s.error(w, 503, "当前云客户端不支持镜像查询")
+		return
+	}
+	typeInfo, err := preflight.DescribeInstanceType(r.Context(), regionID, instanceType)
+	if err != nil {
+		s.error(w, 400, "实例规格预检失败: "+err.Error())
+		return
+	}
+	architecture := normalizeArchitecture(stringValue(typeInfo["CpuArchitecture"]))
+	systemImages, err := preflight.DescribeImagesForArchitecture(r.Context(), regionID, "", architecture)
+	if err != nil {
+		s.error(w, 400, "内置镜像解析失败: "+err.Error())
+		return
+	}
+	customImages, err := preflight.DescribeCustomImages(r.Context(), regionID, architecture)
+	if err != nil {
+		s.error(w, 400, "自定义镜像查询失败: "+err.Error())
+		return
+	}
+	curated := []struct {
+		Key   string
+		Label string
+	}{
+		{Key: "debian_12", Label: "Debian 12"},
+		{Key: "alibaba_cloud_linux_3", Label: "Alibaba Cloud Linux 3"},
+		{Key: "ubuntu_22", Label: "Ubuntu 22.04"},
+		{Key: "ubuntu_24", Label: "Ubuntu 24.04"},
+		{Key: "centos_stream_9", Label: "CentOS Stream 9"},
+		{Key: "windows_2022", Label: "Windows Server 2022"},
+	}
+	options := make([]map[string]any, 0, len(curated)+len(customImages))
+	for _, item := range curated {
+		image := findCuratedECSImage(systemImages, item.Key)
+		if image == nil {
+			continue
+		}
+		imageID := stringValue(image["ImageId"])
+		options = append(options, map[string]any{"value": imageID, "label": item.Label, "source": "system", "osKey": item.Key, "name": stringValue(image["ImageName"]), "osName": stringValue(image["OSName"]), "osType": stringValue(image["OSType"]), "architecture": stringValue(image["Architecture"]), "size": ecsImageMinDiskSize(image)})
+	}
+	customOptions := make([]map[string]any, 0, len(customImages))
+	for _, image := range customImages {
+		imageID := stringValue(image["ImageId"])
+		if imageID == "" {
+			continue
+		}
+		customOptions = append(customOptions, map[string]any{"value": imageID, "label": ecsImageLabel(image), "source": "custom", "osKey": ecsImageOSKey(image), "name": stringValue(image["ImageName"]), "osName": stringValue(image["OSName"]), "osType": stringValue(image["OSType"]), "architecture": stringValue(image["Architecture"]), "size": ecsImageMinDiskSize(image)})
+	}
+	sort.Slice(customOptions, func(i, j int) bool {
+		return stringValue(customOptions[i]["label"]) < stringValue(customOptions[j]["label"])
+	})
+	options = append(options, customOptions...)
+	s.json(w, 200, map[string]any{"success": true, "data": map[string]any{"options": options, "regionId": regionID, "architecture": architecture}})
+}
+
 func (s *Server) diskOptions(w http.ResponseWriter, r *http.Request, data map[string]any) {
 	groupKey := stringValue(data["accountGroupKey"])
 	groups, _ := s.Store.LoadGroups()
@@ -1187,12 +1476,26 @@ func (s *Server) diskOptions(w http.ResponseWriter, r *http.Request, data map[st
 	if instanceType == "" {
 		instanceType = "ecs.e-c4m1.large"
 	}
-	client := s.Cloud
-	if s.CloudFactory != nil {
-		client = s.CloudFactory(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
+	billingMode := stringValue(data["billingMode"])
+	if billingMode == "" {
+		billingMode = cloud.BillingModePostpaid
 	}
+	if billingMode != cloud.BillingModePostpaid && billingMode != cloud.BillingModeSpot {
+		s.error(w, 400, "实例计费类型无效")
+		return
+	}
+	imageSource := stringValue(data["imageSource"])
+	if imageSource == "" {
+		imageSource = "system"
+	}
+	if imageSource != "system" && imageSource != "custom" {
+		s.error(w, 400, "镜像来源无效")
+		return
+	}
+	imageID := strings.TrimSpace(stringValue(data["imageId"]))
+	client := s.cloudClient(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
 	if client == nil {
-		s.json(w, 200, map[string]any{"success": true, "data": map[string]any{"options": []map[string]any{{"value": "cloud_essd_entry", "label": "ESSD Entry", "min": 20, "max": 32768, "unit": "GB"}, {"value": "cloud_essd", "label": "ESSD", "min": 20, "max": 32768, "unit": "GB"}}, "regionId": regionID, "zoneId": ""}})
+		s.json(w, 200, map[string]any{"success": true, "data": map[string]any{"options": []map[string]any{}, "zones": []map[string]any{}, "regionId": regionID, "zoneId": ""}})
 		return
 	}
 	preflight, ok := client.(cloud.PreflightClient)
@@ -1200,7 +1503,40 @@ func (s *Server) diskOptions(w http.ResponseWriter, r *http.Request, data map[st
 		s.error(w, 503, "当前云客户端不支持系统盘预检")
 		return
 	}
-	zones, err := preflight.DescribeAvailableZones(r.Context(), regionID, instanceType, stringValue(data["systemDiskCategory"]))
+	if imageID == "" {
+		s.error(w, 400, "请选择镜像")
+		return
+	}
+	typeInfo, typeErr := preflight.DescribeInstanceType(r.Context(), regionID, instanceType)
+	if typeErr != nil {
+		s.error(w, 400, "实例规格预检失败: "+typeErr.Error())
+		return
+	}
+	architecture := normalizeArchitecture(stringValue(typeInfo["CpuArchitecture"]))
+	var images []map[string]any
+	var imageErr error
+	if imageSource == "custom" {
+		images, imageErr = preflight.DescribeCustomImages(r.Context(), regionID, architecture)
+	} else {
+		images, imageErr = preflight.DescribeImagesForArchitecture(r.Context(), regionID, "", architecture)
+	}
+	if imageErr != nil {
+		s.error(w, 400, map[string]string{"system": "内置镜像查询失败: ", "custom": "自定义镜像查询失败: "}[imageSource]+imageErr.Error())
+		return
+	}
+	var selectedImage map[string]any
+	for _, image := range images {
+		if stringValue(image["ImageId"]) == imageID {
+			selectedImage = image
+			break
+		}
+	}
+	if selectedImage == nil {
+		sourceLabel := map[string]string{"system": "内置", "custom": "自定义"}[imageSource]
+		s.error(w, 400, "所选"+sourceLabel+"镜像不存在、不可用或与实例架构不匹配")
+		return
+	}
+	zones, err := preflight.DescribeAvailableZones(r.Context(), regionID, instanceType, stringValue(data["systemDiskCategory"]), billingMode)
 	if err != nil || len(zones) == 0 {
 		if err == nil {
 			err = fmt.Errorf("没有可用区库存")
@@ -1208,16 +1544,34 @@ func (s *Server) diskOptions(w http.ResponseWriter, r *http.Request, data map[st
 		s.error(w, 400, "可用区预检失败: "+err.Error())
 		return
 	}
-	zoneID := stringValue(data["zoneId"])
-	if zoneID == "" {
-		zoneID = firstMapString(zones, "ZoneId", "zoneId")
+	zoneOptions := make([]map[string]any, 0, len(zones))
+	for _, zone := range zones {
+		zoneID := firstMapString([]map[string]any{zone}, "ZoneId", "zoneId")
+		if zoneID != "" {
+			zoneOptions = append(zoneOptions, map[string]any{"value": zoneID, "label": zoneID})
+		}
 	}
-	options, err := preflight.GetSystemDiskOptions(r.Context(), regionID, zoneID, instanceType)
+	zoneID := strings.TrimSpace(stringValue(data["zoneId"]))
+	if zoneID == "" {
+		s.json(w, 200, map[string]any{"success": true, "data": map[string]any{"options": []map[string]any{}, "zones": zoneOptions, "regionId": regionID, "zoneId": "", "instanceType": instanceType}})
+		return
+	}
+	if !containsMapValue(zones, zoneID, "ZoneId", "zoneId") {
+		s.error(w, 400, "所选可用区没有当前规格库存")
+		return
+	}
+	options, err := preflight.GetSystemDiskOptions(r.Context(), regionID, zoneID, instanceType, billingMode, imageID)
 	if err != nil {
 		s.error(w, 400, "系统盘预检失败: "+err.Error())
 		return
 	}
-	s.json(w, 200, map[string]any{"success": true, "data": map[string]any{"options": options, "regionId": regionID, "zoneId": zoneID, "instanceType": instanceType}})
+	if imageSource == "custom" {
+		imageMinSize := ecsImageMinDiskSize(selectedImage)
+		for _, option := range options {
+			option["min"] = ecsCustomImageDiskMinSize(stringValue(option["value"]), number(option["min"], 1), imageMinSize)
+		}
+	}
+	s.json(w, 200, map[string]any{"success": true, "data": map[string]any{"options": options, "zones": zoneOptions, "regionId": regionID, "zoneId": zoneID, "instanceType": instanceType}})
 }
 func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 	taskID := r.URL.Query().Get("taskId")
@@ -1226,13 +1580,32 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 		s.error(w, 404, "任务不存在")
 		return
 	}
-	if task.Status == "success" {
+	if task.Status == "success" || ((task.Status == "failed" || task.Status == "partial") && task.InstanceID != "") {
 		if consumed, consumeErr := s.Store.ConsumeTaskPassword(taskID); consumeErr == nil {
 			task = consumed
 		} else {
 			s.error(w, 500, "任务凭据读取失败")
 			return
 		}
+	}
+	s.json(w, 200, map[string]any{"success": true, "data": taskResponse(task)})
+}
+
+func (s *Server) instanceCredential(w http.ResponseWriter, data map[string]any) {
+	accountID := int64(number(data["accountId"], 0))
+	account, err := s.Store.Account(accountID, false)
+	if err != nil {
+		s.error(w, 404, "实例不存在")
+		return
+	}
+	task, err := s.Store.ConsumeInstanceTaskPassword(account.InstanceID)
+	if errors.Is(err, os.ErrNotExist) || (err == nil && task.LoginPassword == "") {
+		s.error(w, 404, "该实例没有可查看的初始密码")
+		return
+	}
+	if err != nil {
+		s.error(w, 500, "初始密码读取失败")
+		return
 	}
 	s.json(w, 200, map[string]any{"success": true, "data": taskResponse(task)})
 }
@@ -1268,10 +1641,7 @@ func (s *Server) control(w http.ResponseWriter, data map[string]any) {
 		s.error(w, 400, "无效的操作类型")
 		return
 	}
-	client := s.Cloud
-	if s.CloudFactory != nil {
-		client = s.CloudFactory(*a)
-	}
+	client := s.cloudClient(*a)
 	if client == nil {
 		s.cloudUnavailable(w)
 		return
@@ -1279,7 +1649,7 @@ func (s *Server) control(w http.ResponseWriter, data map[string]any) {
 	if action == "start" {
 		err = client.StartInstance(rctx(), a.RegionID, a.InstanceID)
 	} else {
-		err = client.StopInstance(rctx(), a.RegionID, a.InstanceID, stringOrMap(data, "shutdownMode", "KeepCharging"))
+		err = client.StopInstance(rctx(), a.RegionID, a.InstanceID, app.ResolveShutdownMode(a.StoppedMode, s.Store.GetSetting("shutdown_mode", "KeepCharging")))
 	}
 	if err != nil {
 		s.error(w, 400, err.Error())
@@ -1300,6 +1670,46 @@ func (s *Server) control(w http.ResponseWriter, data map[string]any) {
 	s.dispatchEvent(rctx(), notify.Event{Title: "实例控制指令已提交", Summary: fmt.Sprintf("%s 已提交%s指令", accountDisplay(*a), map[string]string{"start": "开机", "stop": "停机"}[action]), AccountID: accountDisplay(*a), Text: fmt.Sprintf("【ECS 控制台】实例控制指令已提交\n实例: %s\n实例 ID: %s\n区域: %s\n动作: %s\n时间: %s", accountDisplay(*a), a.InstanceID, a.RegionID, action, time.Now().Format("2006-01-02 15:04:05")), Fields: map[string]string{"instance_id": a.InstanceID, "action": action, "region": a.RegionID}})
 	s.json(w, 200, map[string]any{"success": true})
 }
+
+func (s *Server) saveInstanceSchedule(w http.ResponseWriter, data map[string]any) {
+	id := int64(number(data["accountId"], 0))
+	account, err := s.Store.Account(id, false)
+	if err != nil {
+		s.error(w, 404, "实例不存在")
+		return
+	}
+	enabled := truthy(data["enabled"])
+	startTime := strings.TrimSpace(stringValue(data["startTime"]))
+	stopTime := strings.TrimSpace(stringValue(data["stopTime"]))
+	stoppedMode := stringValue(data["stoppedMode"])
+	if stoppedMode == "" {
+		stoppedMode = s.Store.GetSetting("shutdown_mode", "KeepCharging")
+	}
+	if stoppedMode != "KeepCharging" && stoppedMode != "StopCharging" {
+		s.error(w, 400, "停机模式无效")
+		return
+	}
+	if enabled && (!validClock(startTime) || !validClock(stopTime) || startTime == stopTime) {
+		s.error(w, 400, "请填写不同的正常开机和关机时间")
+		return
+	}
+	if !enabled {
+		groups, _ := s.Store.LoadRotationGroups()
+		for _, group := range groups {
+			for _, member := range group.Members {
+				if member.AccountID == id {
+					s.error(w, 400, fmt.Sprintf("实例仍在分组“%s”中，请先从分组移除", group.Name))
+					return
+				}
+			}
+		}
+	}
+	if err := s.Store.UpdateInstanceSettings(account.ID, enabled, startTime, stopTime, stoppedMode); err != nil {
+		s.error(w, 500, "保存实例设置失败")
+		return
+	}
+	s.json(w, 200, map[string]any{"success": true})
+}
 func (s *Server) deleteInstance(w http.ResponseWriter, data map[string]any) {
 	id := int64(number(data["accountId"], 0))
 	a, err := s.Store.Account(id, false)
@@ -1307,7 +1717,7 @@ func (s *Server) deleteInstance(w http.ResponseWriter, data map[string]any) {
 		s.error(w, 404, "账号不存在")
 		return
 	}
-	if s.Cloud == nil && s.CloudFactory == nil {
+	if s.CloudFactory == nil {
 		s.cloudUnavailable(w)
 		return
 	}
@@ -1335,10 +1745,7 @@ func (s *Server) replaceIP(w http.ResponseWriter, data map[string]any) {
 		s.error(w, 404, "账号不存在")
 		return
 	}
-	client := s.Cloud
-	if s.CloudFactory != nil {
-		client = s.CloudFactory(*a)
-	}
+	client := s.cloudClient(*a)
 	if client == nil {
 		s.cloudUnavailable(w)
 		return
@@ -1397,16 +1804,22 @@ func (s *Server) refreshAccount(w http.ResponseWriter, data map[string]any) {
 		s.error(w, 404, "账号不存在")
 		return
 	}
-	client := s.Cloud
-	if s.CloudFactory != nil {
-		client = s.CloudFactory(*a)
-	}
+	client := s.cloudClient(*a)
 	if client == nil {
 		s.cloudUnavailable(w)
 		return
 	}
 	instance, err := client.DescribeInstance(rctx(), a.RegionID, a.InstanceID)
 	if err != nil {
+		if cloud.IsNotFound(err) {
+			if queueErr := s.Store.QueueMissingInstanceCleanup(a.ID, randomToken(16)); queueErr != nil {
+				s.error(w, 500, "云端实例已不存在，但本地清理任务创建失败: "+queueErr.Error())
+				return
+			}
+			s.Store.AddLog("info", "已同步移除云端不存在的实例: "+a.InstanceID)
+			s.json(w, 200, map[string]any{"success": true, "removed": true, "message": "实例已在阿里云释放，本地记录已进入清理流程"})
+			return
+		}
 		s.error(w, 400, err.Error())
 		return
 	}
@@ -1524,6 +1937,8 @@ func (s *Server) syncGroupAction(w http.ResponseWriter, data map[string]any) {
 }
 
 func (s *Server) syncAllInstances(w http.ResponseWriter) {
+	s.inventoryMu.Lock()
+	defer s.inventoryMu.Unlock()
 	groups, err := s.Store.LoadGroups()
 	if err != nil {
 		s.error(w, 500, "读取账号组失败: "+err.Error())
@@ -1531,7 +1946,7 @@ func (s *Server) syncAllInstances(w http.ResponseWriter) {
 	}
 	var failures []string
 	for _, group := range groups {
-		if _, err := s.syncGroup(group.GroupKey); err != nil {
+		if _, err := s.syncGroupContext(rctx(), group.GroupKey, false); err != nil {
 			failures = append(failures, group.GroupKey+": "+err.Error())
 		}
 	}
@@ -1543,6 +1958,39 @@ func (s *Server) syncAllInstances(w http.ResponseWriter) {
 }
 
 func (s *Server) syncGroup(groupKey string) (int, error) {
+	s.inventoryMu.Lock()
+	defer s.inventoryMu.Unlock()
+	return s.syncGroupContext(rctx(), groupKey, false)
+}
+
+// SyncInventory reconciles all configured account groups in the background.
+// Automatic reconciliation requires two successful missing observations before
+// it starts the existing local cleanup flow for an externally removed ECS.
+func (s *Server) SyncInventory(ctx context.Context) (int, error) {
+	s.inventoryMu.Lock()
+	defer s.inventoryMu.Unlock()
+	groups, err := s.Store.LoadGroups()
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	var failures []string
+	for _, group := range groups {
+		groupCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		count, syncErr := s.syncGroupContext(groupCtx, group.GroupKey, true)
+		cancel()
+		total += count
+		if syncErr != nil {
+			failures = append(failures, group.GroupKey+": "+syncErr.Error())
+		}
+	}
+	if len(failures) > 0 {
+		return total, fmt.Errorf("部分账号组同步失败: %s", strings.Join(failures, "; "))
+	}
+	return total, nil
+}
+
+func (s *Server) syncGroupContext(ctx context.Context, groupKey string, confirmMissing bool) (int, error) {
 	groups, err := s.Store.LoadGroups()
 	if err != nil {
 		return 0, err
@@ -1557,14 +2005,11 @@ func (s *Server) syncGroup(groupKey string) (int, error) {
 	if group == nil {
 		return 0, fmt.Errorf("账号组不存在")
 	}
-	client := s.Cloud
-	if s.CloudFactory != nil {
-		client = s.CloudFactory(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
-	}
+	client := s.cloudClient(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
 	if client == nil {
 		return 0, fmt.Errorf("云客户端未配置")
 	}
-	instances, err := client.DescribeInstances(rctx(), group.RegionID)
+	instances, err := client.DescribeInstances(ctx, group.RegionID)
 	if err != nil {
 		return 0, err
 	}
@@ -1579,7 +2024,7 @@ func (s *Server) syncGroup(groupKey string) (int, error) {
 		for _, instance := range instances {
 			instanceIDs = append(instanceIDs, instance.ID)
 		}
-		if networks, networkErr := networkClient.DescribeInstancePublicNetworks(rctx(), group.RegionID, instanceIDs); networkErr != nil {
+		if networks, networkErr := networkClient.DescribeInstancePublicNetworks(ctx, group.RegionID, instanceIDs); networkErr != nil {
 			s.Log.Printf("同步实例公网带宽失败（账号组 %s）: %v", group.GroupKey, networkErr)
 		} else {
 			publicNetworks = networks
@@ -1599,12 +2044,15 @@ func (s *Server) syncGroup(groupKey string) (int, error) {
 				break
 			}
 		}
+		if existing != nil {
+			_ = s.Store.SetSetting(inventoryMissingKey(existing.ID), "0")
+		}
 		if existing != nil && (existing.IsDeleted != 0 || existing.InstanceStatus == "Releasing") {
 			// A user-triggered release must not be resurrected by a manual sync
 			// while the remote ECS record is still visible.
 			continue
 		}
-		a := app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, InstanceID: instance.ID, MaxTraffic: group.MaxTraffic, ScheduleEnabled: group.ScheduleEnabled, ScheduleStartEnabled: group.ScheduleStartEnabled, ScheduleStopEnabled: group.ScheduleStopEnabled, StartTime: group.StartTime, StopTime: group.StopTime, Remark: group.Remark, SiteType: group.SiteType, GroupKey: group.GroupKey, InstanceName: instance.Name, InstanceType: instance.InstanceType, InternetBandwidth: instance.InternetBandwidth, PublicIP: instance.PublicIP, PublicIPMode: "ecs_public_ip", PrivateIP: instance.PrivateIP, CPU: instance.CPU, Memory: instance.Memory, OSName: instance.OSName, InstanceStatus: instance.Status, HealthStatus: "ok", UpdatedAt: time.Now().Unix()}
+		a := app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, InstanceID: instance.ID, MaxTraffic: group.MaxTraffic, Remark: group.Remark, SiteType: group.SiteType, GroupKey: group.GroupKey, InstanceName: instance.Name, InstanceType: instance.InstanceType, InternetBandwidth: instance.InternetBandwidth, PublicIP: instance.PublicIP, PublicIPMode: "ecs_public_ip", PrivateIP: instance.PrivateIP, CPU: instance.CPU, Memory: instance.Memory, OSName: instance.OSName, InstanceStatus: instance.Status, HealthStatus: "ok", UpdatedAt: time.Now().Unix()}
 		if network, hasEIP := publicNetworks[instance.ID]; hasEIP {
 			a.PublicIPMode = "eip"
 			a.EIPAllocationID, a.EIPAddress = network.AllocationID, network.Address
@@ -1623,6 +2071,9 @@ func (s *Server) syncGroup(groupKey string) (int, error) {
 			a.LastKeepAliveAt, a.AutoStartBlocked = existing.LastKeepAliveAt, existing.AutoStartBlocked
 			a.ScheduleLastStartDate, a.ScheduleLastStopDate = existing.ScheduleLastStartDate, existing.ScheduleLastStopDate
 			a.ScheduleStopActive, a.ScheduleBlockedByTraffic = existing.ScheduleStopActive, existing.ScheduleBlockedByTraffic
+			a.ScheduleEnabled, a.ScheduleStartEnabled, a.ScheduleStopEnabled = existing.ScheduleEnabled, existing.ScheduleStartEnabled, existing.ScheduleStopEnabled
+			a.StartTime, a.StopTime = existing.StartTime, existing.StopTime
+			a.StoppedMode = existing.StoppedMode
 			a.TrafficAPIStatus, a.TrafficAPIMessage = existing.TrafficAPIStatus, existing.TrafficAPIMessage
 			a.ProtectionSuspended, a.ProtectionSuspendReason, a.ProtectionNotifiedAt = existing.ProtectionSuspended, existing.ProtectionSuspendReason, existing.ProtectionNotifiedAt
 			if network, hasEIP := publicNetworks[instance.ID]; hasEIP {
@@ -1652,6 +2103,19 @@ func (s *Server) syncGroup(groupKey string) (int, error) {
 		if !sameGroup {
 			continue
 		}
+		missingKey := inventoryMissingKey(account.ID)
+		if confirmMissing {
+			missingCount, _ := strconv.Atoi(s.Store.GetSetting(missingKey, "0"))
+			missingCount++
+			if err := s.Store.SetSetting(missingKey, strconv.Itoa(missingCount)); err != nil {
+				return count, err
+			}
+			if missingCount < 2 {
+				s.Store.AddLog("warning", "账号清单同步首次未发现实例，等待下次确认: "+account.InstanceID)
+				continue
+			}
+		}
+		_ = s.Store.SetSetting(missingKey, "0")
 		if account.InstanceStatus == "ReleaseFailed" {
 			// A failed release is safe to forget only after a successful,
 			// complete DescribeInstances response confirms this exact instance ID
@@ -1663,17 +2127,19 @@ func (s *Server) syncGroup(groupKey string) (int, error) {
 			}
 			continue
 		}
-		// The instance disappeared outside this controller. Route it through
-		// the same safe delete queue so EIP and DDNS cleanup still happens.
-		if err := s.Store.MarkReleasing(account.ID); err != nil {
+		// The instance disappeared outside this controller. Hide the stale row
+		// immediately and atomically queue EIP/DDNS/group cleanup. A terminal
+		// cleanup failure restores it as ReleaseFailed for manual intervention.
+		if err := s.Store.QueueMissingInstanceCleanup(account.ID, randomToken(16)); err != nil {
 			return count, err
 		}
-		_ = s.Store.EnqueueJob(randomToken(16), "delete_instance", strconv.FormatInt(account.ID, 10), map[string]any{"accountId": account.ID, "forceStop": true})
-	}
-	if s.Store.GetSetting("ddns_enabled", "0") == "1" {
-		_ = s.Store.SetSetting("last_ddns_reconcile", "0")
+		s.Store.AddLog("info", "已同步移除云端不存在的实例: "+account.InstanceID)
 	}
 	return count, nil
+}
+
+func inventoryMissingKey(accountID int64) string {
+	return "inventory_missing_" + strconv.FormatInt(accountID, 10)
 }
 
 func (s *Server) fetchInstances(w http.ResponseWriter, data map[string]any) {
@@ -1904,7 +2370,7 @@ func (s *Server) csrfOK(w http.ResponseWriter, r *http.Request) bool {
 }
 func (s *Server) mutating(a string) bool {
 	switch a {
-	case "save_config", "upload_logo", "clear_logs", "logout", "create_ecs", "control_instance", "delete_instance", "replace_instance_ip", "refresh_account", "sync_account_group", "sync_instances", "restore_schedule_block", "send_test_email", "send_test_telegram", "send_test_webhook", "start_update", "passkey_register_start", "passkey_register_finish":
+	case "save_config", "upload_logo", "clear_logs", "logout", "create_ecs", "control_instance", "save_instance_schedule", "delete_instance", "replace_instance_ip", "get_instance_initial_credential", "refresh_account", "sync_account_group", "sync_instances", "restore_schedule_block", "send_test_email", "send_test_telegram", "send_test_webhook", "start_update", "passkey_register_start", "passkey_register_finish":
 		return true
 	}
 	return false
@@ -2016,6 +2482,112 @@ func loginPortForOS(osKey string) int {
 	return 22
 }
 
+func ecsImageOSKey(image map[string]any) string {
+	text := strings.ToLower(stringValue(image["OSType"]) + " " + stringValue(image["Platform"]) + " " + stringValue(image["OSName"]) + " " + stringValue(image["ImageName"]))
+	if strings.Contains(text, "windows") {
+		return "windows_custom"
+	}
+	return "linux_custom"
+}
+
+const debianCloudInitUserData = `#cloud-config
+ssh_pwauth: true
+disable_root: false
+write_files:
+  - path: /etc/ssh/sshd_config.d/00-ecs-controller.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PermitRootLogin yes
+runcmd:
+  - [sh, -c, "systemctl try-restart ssh.service || systemctl try-restart sshd.service || true"]
+`
+
+const alpineCloudInitUserData = `#cloud-config
+ssh_pwauth: true
+disable_root: false
+write_files:
+  - path: /etc/ssh/sshd_config.d/00-ecs-controller.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PermitRootLogin yes
+runcmd:
+  - |
+      if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' /etc/ssh/sshd_config; then
+        sed -i '1iInclude /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+      fi
+      rc-service sshd restart || service sshd restart || true
+`
+
+func ecsImageCloudInitUserData(image map[string]any) (string, string) {
+	if image == nil {
+		return "", ""
+	}
+	text := strings.ToLower(strings.Join([]string{stringValue(image["ImageName"]), stringValue(image["OSName"]), stringValue(image["Platform"]), stringValue(image["Description"])}, " "))
+	switch {
+	case strings.Contains(text, "debian"):
+		return debianCloudInitUserData, "Debian"
+	case strings.Contains(text, "alpine"):
+		return alpineCloudInitUserData, "Alpine"
+	default:
+		return "", ""
+	}
+}
+
+func findCuratedECSImage(images []map[string]any, key string) map[string]any {
+	for _, image := range images {
+		text := strings.ToLower(strings.Join([]string{stringValue(image["ImageName"]), stringValue(image["OSName"]), stringValue(image["Platform"]), stringValue(image["Description"])}, " "))
+		matched := false
+		switch key {
+		case "debian_12":
+			matched = strings.Contains(text, "debian") && strings.Contains(text, "12")
+		case "alibaba_cloud_linux_3":
+			matched = (strings.Contains(text, "alibaba cloud linux") || strings.Contains(text, "aliyun_3")) && strings.Contains(text, "3")
+		case "ubuntu_22":
+			matched = strings.Contains(text, "ubuntu") && strings.Contains(text, "22")
+		case "ubuntu_24":
+			matched = strings.Contains(text, "ubuntu") && strings.Contains(text, "24")
+		case "centos_stream_9":
+			matched = strings.Contains(text, "centos") && strings.Contains(text, "stream") && strings.Contains(text, "9")
+		case "windows_2022":
+			matched = strings.Contains(text, "windows") && (strings.Contains(text, "2022") || strings.Contains(text, "21h2"))
+		}
+		if matched {
+			return image
+		}
+	}
+	return nil
+}
+
+func ecsImageLabel(image map[string]any) string {
+	name := strings.TrimSpace(stringValue(image["ImageName"]))
+	if name == "" {
+		name = strings.TrimSpace(stringValue(image["OSName"]))
+	}
+	if name == "" {
+		name = stringValue(image["ImageId"])
+	}
+	return fmt.Sprintf("%s · %d GB", name, ecsImageMinDiskSize(image))
+}
+
+func ecsImageMinDiskSize(image map[string]any) int {
+	size := number(image["Size"], 1)
+	if size < 1 {
+		return 1
+	}
+	return size
+}
+
+func ecsCustomImageDiskMinSize(category string, apiMin, imageMin int) int {
+	if category == "cloud_essd" || category == "cloud_auto" {
+		return max(1, imageMin)
+	}
+	return max(apiMin, imageMin)
+}
+
 func normalizeArchitecture(value string) string {
 	value = strings.ToLower(value)
 	if strings.Contains(value, "arm") || strings.Contains(value, "aarch64") {
@@ -2112,6 +2684,8 @@ func number(v any, fallback int) int {
 		return int(n)
 	case int:
 		return n
+	case int64:
+		return int(n)
 	case string:
 		i, e := strconv.Atoi(n)
 		if e == nil {

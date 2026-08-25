@@ -170,6 +170,7 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS telegram_action_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT UNIQUE NOT NULL, user_id TEXT NOT NULL, chat_id TEXT NOT NULL, action TEXT NOT NULL, account_id INTEGER NOT NULL, payload TEXT DEFAULT '', expires_at INTEGER NOT NULL, used_at INTEGER DEFAULT 0, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS passkey_credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, credential_id TEXT UNIQUE NOT NULL, credential_data TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS passkey_challenges (id TEXT PRIMARY KEY, kind TEXT NOT NULL, session_id TEXT DEFAULT '', session_data TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS rotation_states (group_id TEXT NOT NULL, account_id INTEGER NOT NULL, last_start_date TEXT DEFAULT '', last_stop_date TEXT DEFAULT '', dns_updated_date TEXT DEFAULT '', last_error TEXT DEFAULT '', PRIMARY KEY(group_id, account_id))`,
 	}
 	for _, statement := range statements {
 		if _, err := s.DB.Exec(statement); err != nil {
@@ -331,7 +332,7 @@ func (s *Store) migratePlaintextSecrets() error {
 		}
 	}
 
-	for _, key := range []string{"notify_password", "notify_tg_token", "notify_tg_proxy_pass", "ddns_cf_token"} {
+	for _, key := range []string{"notify_password", "notify_tg_token", "notify_tg_proxy_pass"} {
 		var value string
 		err := s.DB.QueryRow(`SELECT value FROM settings WHERE key=?`, key).Scan(&value)
 		if errors.Is(err, sql.ErrNoRows) || value == "" || strings.HasPrefix(value, "ENC1") {
@@ -592,10 +593,10 @@ func (s *Store) PruneMaintenance(now time.Time) error {
 	}
 	// Keep task status long enough for the UI, but never retain a successful
 	// task's credential indefinitely if the browser never consumes it.
-	if _, err = s.DB.Exec(`UPDATE ecs_create_tasks SET login_password='' WHERE status IN ('success','failed') AND updated_at<?`, now.Add(-24*time.Hour).Unix()); err != nil {
+	if _, err = s.DB.Exec(`UPDATE ecs_create_tasks SET login_password='' WHERE status IN ('success','failed','partial') AND updated_at<?`, now.Add(-24*time.Hour).Unix()); err != nil {
 		return err
 	}
-	_, err = s.DB.Exec(`DELETE FROM ecs_create_tasks WHERE status IN ('success','failed') AND updated_at<?`, now.Add(-30*24*time.Hour).Unix())
+	_, err = s.DB.Exec(`DELETE FROM ecs_create_tasks WHERE status IN ('success','failed','partial') AND updated_at<?`, now.Add(-30*24*time.Hour).Unix())
 	return err
 }
 
@@ -617,7 +618,63 @@ func (s *Store) ClearLoginFailures(ip string) {
 	_, _ = s.DB.Exec(`DELETE FROM login_attempts WHERE ip=?`, ip)
 }
 
-func (s *Store) IsInitialized() bool { return s.GetSetting("admin_password", "") != "" }
+func (s *Store) IsInitialized() bool {
+	return s.GetSetting("admin_username", "") != "" && s.GetSetting("admin_password", "") != ""
+}
+
+func (s *Store) SetAdminCredentials(username, password string) error {
+	username = strings.TrimSpace(username)
+	if err := ValidateAdminUsername(username); err != nil {
+		return err
+	}
+	if len(password) < 6 {
+		return fmt.Errorf("管理员密码至少需要 6 个字符")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for key, value := range map[string]string{"admin_username": username, "admin_password": string(hash)} {
+		if _, err := tx.Exec(`INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func ValidateAdminUsername(username string) error {
+	if !validAdminUsername(strings.TrimSpace(username)) {
+		return fmt.Errorf("管理员用户名必须为 3 到 32 位，且只能包含字母、数字、下划线、连字符和句点")
+	}
+	return nil
+}
+
+func (s *Store) SetAdminUsername(username string) error {
+	username = strings.TrimSpace(username)
+	if err := ValidateAdminUsername(username); err != nil {
+		return err
+	}
+	return s.SetSetting("admin_username", username)
+}
+
+func validAdminUsername(username string) bool {
+	if len(username) < 3 || len(username) > 32 {
+		return false
+	}
+	for i := 0; i < len(username); i++ {
+		c := username[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
 
 func (s *Store) SetAdminPassword(password string) error {
 	if len(password) < 6 {
@@ -658,6 +715,13 @@ func (s *Store) CheckAdminPassword(password string) bool {
 		return true
 	}
 	return false
+}
+
+func (s *Store) CheckAdminCredentials(username, password string) bool {
+	storedUsername := s.GetSetting("admin_username", "")
+	usernameMatches := subtle.ConstantTimeCompare([]byte(storedUsername), []byte(strings.TrimSpace(username))) == 1
+	passwordMatches := s.CheckAdminPassword(password)
+	return usernameMatches && passwordMatches
 }
 
 func verifyPHPArgon2(encoded, password string) bool {
@@ -748,6 +812,31 @@ func (s *Store) EnqueueJob(jobID, kind, entityKey string, payload any) error {
 	now := time.Now().Unix()
 	_, err = s.DB.Exec(`INSERT INTO jobs(job_id,kind,entity_key,status,payload,attempts,available_at,created_at,updated_at) VALUES(?,?,?,?,?,0,?,?,?)`, jobID, kind, entityKey, "queued", string(raw), now, now, now)
 	return err
+}
+
+// QueueMissingInstanceCleanup atomically hides an instance that a successful
+// cloud query confirmed no longer exists and queues the remaining local/EIP
+// cleanup. Keeping the encrypted credential until the job finishes allows a
+// managed EIP to be released safely.
+func (s *Store) QueueMissingInstanceCleanup(id int64, jobID string) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	result, err := tx.Exec(`UPDATE accounts SET is_deleted=1,instance_status='Releasing',updated_at=? WHERE id=? AND is_deleted=0`, now, id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed == 0 {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO jobs(job_id,kind,entity_key,status,payload,attempts,available_at,created_at,updated_at) VALUES(?,?,?,?,?,0,?,?,?)`, jobID, "delete_instance", strconv.FormatInt(id, 10), "queued", "{}", now, now, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ClaimJob(lease time.Duration) (*Job, error) {
@@ -842,6 +931,19 @@ func (s *Store) Account(id int64, includeDeleted bool) (*app.Account, error) {
 	return nil, sql.ErrNoRows
 }
 
+func (s *Store) AccountByInstance(instanceID string) (*app.Account, error) {
+	accounts, err := s.LoadAccounts(false)
+	if err != nil {
+		return nil, err
+	}
+	for i := range accounts {
+		if accounts[i].InstanceID == instanceID {
+			return &accounts[i], nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+
 func (s *Store) UpsertAccount(a app.Account) error {
 	secret, err := s.Seal(a.AccessKeySecret)
 	if err != nil {
@@ -871,6 +973,10 @@ func (s *Store) MarkDeleted(id int64) error {
 }
 func (s *Store) MarkReleasing(id int64) error {
 	_, err := s.DB.Exec(`UPDATE accounts SET instance_status='Releasing',updated_at=? WHERE id=? AND is_deleted=0`, time.Now().Unix(), id)
+	return err
+}
+func (s *Store) MarkReleaseFailed(id int64) error {
+	_, err := s.DB.Exec(`UPDATE accounts SET is_deleted=0,instance_status='ReleaseFailed',updated_at=? WHERE id=? AND is_deleted<>2`, time.Now().Unix(), id)
 	return err
 }
 func (s *Store) PhysicallyDelete(id int64) error {
@@ -956,30 +1062,37 @@ func (s *Store) UpdateScheduleExecutionState(id int64, action, date string) erro
 	return err
 }
 
+func (s *Store) UpdateInstanceSchedule(id int64, enabled bool, startTime, stopTime string) error {
+	_, err := s.DB.Exec(`UPDATE accounts SET schedule_enabled=?,schedule_start_enabled=?,schedule_stop_enabled=?,start_time=?,stop_time=?,schedule_last_start_date='',schedule_last_stop_date='',schedule_stop_active=0 WHERE id=? AND is_deleted=0`, boolInt(enabled), boolInt(enabled), boolInt(enabled), strings.TrimSpace(startTime), strings.TrimSpace(stopTime), id)
+	return err
+}
+
+func (s *Store) UpdateInstanceSettings(id int64, enabled bool, startTime, stopTime, stoppedMode string) error {
+	_, err := s.DB.Exec(`UPDATE accounts SET schedule_enabled=?,schedule_start_enabled=?,schedule_stop_enabled=?,start_time=?,stop_time=?,stopped_mode=?,schedule_last_start_date='',schedule_last_stop_date='',schedule_stop_active=0 WHERE id=? AND is_deleted=0`, boolInt(enabled), boolInt(enabled), boolInt(enabled), strings.TrimSpace(startTime), strings.TrimSpace(stopTime), stoppedMode, id)
+	return err
+}
+
 func (s *Store) SetGroupScheduleBlocked(groupKey string, blocked bool) error {
 	_, err := s.DB.Exec(`UPDATE accounts SET schedule_blocked_by_traffic=? WHERE group_key=?`, boolInt(blocked), groupKey)
 	return err
 }
 
 func (s *Store) ApplyGroupSettings(group app.AccountGroup) error {
-	args := []any{group.AccessKeyID, group.RegionID, group.MaxTraffic, boolInt(group.ScheduleEnabled), boolInt(group.ScheduleStartEnabled), boolInt(group.ScheduleStopEnabled), group.StartTime, group.StopTime, group.Remark, group.SiteType, group.GroupKey, group.GroupKey, group.AccessKeyID, group.RegionID}
-	query := `UPDATE accounts SET access_key_id=?,region_id=?,max_traffic=?,schedule_enabled=?,schedule_start_enabled=?,schedule_stop_enabled=?,start_time=?,stop_time=?,remark=?,site_type=?,group_key=? WHERE group_key=? OR (group_key='' AND access_key_id=? AND region_id=?)`
+	args := []any{group.AccessKeyID, group.RegionID, group.MaxTraffic, group.Remark, group.SiteType, group.GroupKey, group.GroupKey, group.AccessKeyID, group.RegionID}
+	query := `UPDATE accounts SET access_key_id=?,region_id=?,max_traffic=?,remark=?,site_type=?,group_key=? WHERE group_key=? OR (group_key='' AND access_key_id=? AND region_id=?)`
 	if strings.TrimSpace(group.AccessKeySecret) != "" && group.AccessKeySecret != "********" {
 		sealed, err := s.Seal(group.AccessKeySecret)
 		if err != nil {
 			return err
 		}
-		query = `UPDATE accounts SET access_key_id=?,access_key_secret=?,region_id=?,max_traffic=?,schedule_enabled=?,schedule_start_enabled=?,schedule_stop_enabled=?,start_time=?,stop_time=?,remark=?,site_type=?,group_key=? WHERE group_key=? OR (group_key='' AND access_key_id=? AND region_id=?)`
+		query = `UPDATE accounts SET access_key_id=?,access_key_secret=?,region_id=?,max_traffic=?,remark=?,site_type=?,group_key=? WHERE group_key=? OR (group_key='' AND access_key_id=? AND region_id=?)`
 		args = append([]any{group.AccessKeyID, sealed}, args[1:]...)
 	}
 	_, err := s.DB.Exec(query, args...)
 	if err != nil {
 		return err
 	}
-	if !group.ScheduleEnabled || !group.ScheduleStopEnabled {
-		_, err = s.DB.Exec(`UPDATE accounts SET schedule_stop_active=0 WHERE group_key=? OR (group_key='' AND access_key_id=? AND region_id=?)`, group.GroupKey, group.AccessKeyID, group.RegionID)
-	}
-	return err
+	return nil
 }
 
 // RemoveAccountsOutsideGroups hides local records whose account group was
@@ -1145,6 +1258,167 @@ func (s *Store) LoadGroups() ([]app.AccountGroup, error) {
 	return groups, nil
 }
 
+type rotationGroupSecrets struct {
+	CloudflareToken string `json:"cloudflareToken,omitempty"`
+	DNSPodSecretKey string `json:"dnspodSecretKey,omitempty"`
+	AliDNSSecret    string `json:"alidnsAccessKeySecret,omitempty"`
+}
+
+func (s *Store) SaveRotationGroups(groups []app.RotationGroup) error {
+	existingSecrets, err := s.loadRotationGroupSecrets()
+	if err != nil {
+		return err
+	}
+	copyGroups := make([]app.RotationGroup, len(groups))
+	copy(copyGroups, groups)
+	secrets := make(map[string]rotationGroupSecrets, len(copyGroups))
+	for i := range copyGroups {
+		group := &copyGroups[i]
+		secret := existingSecrets[group.ID]
+		if value := strings.TrimSpace(group.DNS.CloudflareToken); value != "" && value != "********" {
+			secret.CloudflareToken = value
+		}
+		if value := strings.TrimSpace(group.DNS.DNSPodSecretKey); value != "" && value != "********" {
+			secret.DNSPodSecretKey = value
+		}
+		if value := strings.TrimSpace(group.DNS.AliDNSSecret); value != "" && value != "********" {
+			secret.AliDNSSecret = value
+		}
+		secrets[group.ID] = secret
+		group.DNS.CloudflareToken = ""
+		group.DNS.DNSPodSecretKey = ""
+		group.DNS.AliDNSSecret = ""
+	}
+	groupsRaw, err := json.Marshal(copyGroups)
+	if err != nil {
+		return err
+	}
+	secretsRaw, err := json.Marshal(secrets)
+	if err != nil {
+		return err
+	}
+	sealedSecrets, err := s.Seal(string(secretsRaw))
+	if err != nil {
+		return err
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for key, value := range map[string]string{"rotation_groups": string(groupsRaw), "rotation_group_secrets": sealedSecrets} {
+		if _, err := tx.Exec(`INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) LoadRotationGroups() ([]app.RotationGroup, error) {
+	var groups []app.RotationGroup
+	if err := json.Unmarshal([]byte(s.GetSetting("rotation_groups", "[]")), &groups); err != nil {
+		return nil, fmt.Errorf("解析分组配置失败: %w", err)
+	}
+	secrets, err := s.loadRotationGroupSecrets()
+	if err != nil {
+		return nil, err
+	}
+	for i := range groups {
+		secret := secrets[groups[i].ID]
+		groups[i].DNS.CloudflareToken = secret.CloudflareToken
+		groups[i].DNS.DNSPodSecretKey = secret.DNSPodSecretKey
+		groups[i].DNS.AliDNSSecret = secret.AliDNSSecret
+	}
+	return groups, nil
+}
+
+func (s *Store) AddRotationMember(groupID string, accountID int64) error {
+	groups, err := s.LoadRotationGroups()
+	if err != nil {
+		return err
+	}
+	target := -1
+	for i := range groups {
+		if groups[i].ID == groupID {
+			target = i
+		}
+		for _, member := range groups[i].Members {
+			if member.AccountID == accountID {
+				if groups[i].ID == groupID {
+					return nil
+				}
+				return fmt.Errorf("实例已属于其他分组")
+			}
+		}
+	}
+	if target < 0 {
+		return fmt.Errorf("轮转分组不存在")
+	}
+	groups[target].Members = append(groups[target].Members, app.RotationMember{AccountID: accountID})
+	return s.SaveRotationGroups(groups)
+}
+
+func (s *Store) RemoveRotationMember(accountID int64) error {
+	groups, err := s.LoadRotationGroups()
+	if err != nil {
+		return err
+	}
+	changed := false
+	for i := range groups {
+		members := groups[i].Members[:0]
+		for _, member := range groups[i].Members {
+			if member.AccountID == accountID {
+				changed = true
+				continue
+			}
+			members = append(members, member)
+		}
+		groups[i].Members = members
+	}
+	if !changed {
+		return nil
+	}
+	return s.SaveRotationGroups(groups)
+}
+
+func (s *Store) loadRotationGroupSecrets() (map[string]rotationGroupSecrets, error) {
+	result := map[string]rotationGroupSecrets{}
+	sealed := s.GetSetting("rotation_group_secrets", "")
+	if sealed == "" {
+		return result, nil
+	}
+	raw, err := s.OpenSecret(sealed)
+	if err != nil {
+		return nil, fmt.Errorf("解密分组 DNS 凭据失败: %w", err)
+	}
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		return nil, fmt.Errorf("解析分组 DNS 凭据失败: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Store) RotationStates(groupID string) (map[int64]app.RotationState, error) {
+	rows, err := s.DB.Query(`SELECT group_id,account_id,COALESCE(last_start_date,''),COALESCE(last_stop_date,''),COALESCE(dns_updated_date,''),COALESCE(last_error,'') FROM rotation_states WHERE group_id=?`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[int64]app.RotationState{}
+	for rows.Next() {
+		var state app.RotationState
+		if err := rows.Scan(&state.GroupID, &state.AccountID, &state.LastStartDate, &state.LastStopDate, &state.DNSUpdatedDate, &state.LastError); err != nil {
+			return nil, err
+		}
+		result[state.AccountID] = state
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) SaveRotationState(state app.RotationState) error {
+	_, err := s.DB.Exec(`INSERT INTO rotation_states(group_id,account_id,last_start_date,last_stop_date,dns_updated_date,last_error) VALUES(?,?,?,?,?,?) ON CONFLICT(group_id,account_id) DO UPDATE SET last_start_date=excluded.last_start_date,last_stop_date=excluded.last_stop_date,dns_updated_date=excluded.dns_updated_date,last_error=excluded.last_error`, state.GroupID, state.AccountID, state.LastStartDate, state.LastStopDate, state.DNSUpdatedDate, state.LastError)
+	return err
+}
+
 func derivedGroupKey(accessKeyID, regionID string) string {
 	sum := sha1.Sum([]byte(strings.TrimSpace(accessKeyID) + "|" + strings.TrimSpace(regionID)))
 	return fmt.Sprintf("%x", sum[:])[:16]
@@ -1177,7 +1451,7 @@ func deriveGroupsFromAccounts(accounts []app.Account) []app.AccountGroup {
 		if maxTraffic <= 0 {
 			maxTraffic = 200
 		}
-		groups = append(groups, app.AccountGroup{GroupKey: key, AccessKeyID: account.AccessKeyID, AccessKeySecret: account.AccessKeySecret, RegionID: account.RegionID, SiteType: siteType, MaxTraffic: maxTraffic, Remark: account.Remark, ScheduleEnabled: account.ScheduleEnabled, ScheduleStartEnabled: account.ScheduleStartEnabled, ScheduleStopEnabled: account.ScheduleStopEnabled, StartTime: account.StartTime, StopTime: account.StopTime, ScheduleBlockedByTraffic: account.ScheduleBlockedByTraffic})
+		groups = append(groups, app.AccountGroup{GroupKey: key, AccessKeyID: account.AccessKeyID, AccessKeySecret: account.AccessKeySecret, RegionID: account.RegionID, SiteType: siteType, MaxTraffic: maxTraffic, Remark: account.Remark, ScheduleBlockedByTraffic: account.ScheduleBlockedByTraffic})
 	}
 	return groups
 }
@@ -1262,26 +1536,27 @@ func (s *Store) GetTask(taskID string) (*app.EcsTask, error) {
 	return task, nil
 }
 
-// ConsumeTaskPassword atomically clears and returns the password for a
-// successful create task. A second browser/tab receives an empty password.
+// ConsumeTaskPassword atomically clears and returns the password once an ECS
+// instance exists. This also covers partial/failed tasks whose instance was
+// retained after a later configuration step failed.
 func (s *Store) ConsumeTaskPassword(taskID string) (*app.EcsTask, error) {
 	task, err := s.GetTaskForWorker(taskID)
 	if err != nil {
 		return nil, err
 	}
-	if task.Status != "success" || task.LoginPassword == "" {
+	if task.LoginPassword == "" || (task.Status != "success" && task.InstanceID == "") {
 		task.LoginPassword = ""
 		return task, nil
 	}
 	var sealed string
-	if err := s.DB.QueryRow(`SELECT login_password FROM ecs_create_tasks WHERE task_id=? AND status='success'`, taskID).Scan(&sealed); err != nil {
+	if err := s.DB.QueryRow(`SELECT login_password FROM ecs_create_tasks WHERE task_id=? AND login_password<>''`, taskID).Scan(&sealed); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			task.LoginPassword = ""
 			return task, nil
 		}
 		return nil, err
 	}
-	result, err := s.DB.Exec(`UPDATE ecs_create_tasks SET login_password='',updated_at=? WHERE task_id=? AND status='success' AND login_password=?`, time.Now().Unix(), taskID, sealed)
+	result, err := s.DB.Exec(`UPDATE ecs_create_tasks SET login_password='',updated_at=? WHERE task_id=? AND login_password=?`, time.Now().Unix(), taskID, sealed)
 	if err != nil {
 		return nil, err
 	}
@@ -1293,6 +1568,35 @@ func (s *Store) ConsumeTaskPassword(taskID string) (*app.EcsTask, error) {
 		task.LoginPassword = ""
 	}
 	return task, nil
+}
+
+func (s *Store) CredentialTaskInstances() (map[string]bool, error) {
+	rows, err := s.DB.Query(`SELECT DISTINCT instance_id FROM ecs_create_tasks WHERE instance_id<>'' AND login_password<>''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[string]bool{}
+	for rows.Next() {
+		var instanceID string
+		if err := rows.Scan(&instanceID); err != nil {
+			return nil, err
+		}
+		result[instanceID] = true
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) ConsumeInstanceTaskPassword(instanceID string) (*app.EcsTask, error) {
+	var taskID string
+	err := s.DB.QueryRow(`SELECT task_id FROM ecs_create_tasks WHERE instance_id=? AND login_password<>'' ORDER BY id DESC LIMIT 1`, instanceID).Scan(&taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, os.ErrNotExist
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.ConsumeTaskPassword(taskID)
 }
 
 func (s *Store) LastRun() int64 {

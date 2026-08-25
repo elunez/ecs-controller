@@ -6,35 +6,36 @@
 
 ## 部署
 
-准备一台安装了 Docker 的公网 Linux 服务器。如果使用域名，请先将域名解析到服务器 IP。
+准备一台使用 systemd 或 OpenRC 的 Linux 服务器。如果使用域名，请先将域名解析到服务器 IP。当前支持 AMD64 和 ARM64。
 
 在服务器上运行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kori1c/ecs-controller/main/install.sh \
-  | env ECS_COOKIE_SECURE=1 bash
+curl -fsSL https://raw.githubusercontent.com/elunez/ecs-controller/main/install.sh \
+  | sudo env ECS_COOKIE_SECURE=1 sh
 ```
 
-安装脚本会自动下载镜像并启动服务，不会在服务器上编译镜像。服务默认只监听服务器本机的 `43211` 端口，请通过你现有的 HTTPS 访问方式打开面板，不要直接开放这个端口。
+安装脚本会自动识别处理器架构，从 GitHub Release 下载并校验预构建程序，然后创建系统服务并启动。服务器不需要安装 Docker、Git 或 Go。
+
+程序安装在 `/opt/ecs-controller`，数据保存在 `/var/lib/ecs-controller`。服务默认只监听服务器本机的 `43211` 端口，请通过你现有的 HTTPS 访问方式打开面板，不要直接开放这个端口。
 
 公网使用 Passkey 时必须使用 HTTPS。
 
 ### 本地测试
 
-在自己的电脑上测试时，可以使用 Docker Desktop 或 Colima，安装后访问 `http://127.0.0.1:43211`。
+在自己的电脑上测试时，需要安装 Go 1.26 或允许 Go 自动下载对应工具链。在项目根目录执行：
+
+```bash
+./run-local.sh
+```
+
+启动后访问 `http://127.0.0.1:43211`。本地数据保存在 `.local/data`，本地源码模式不启用后台在线更新；阿里云相关功能需要在界面中配置账号凭据后才能调用。
 
 ## 第一次使用
 
-1. 安装完成后，脚本会显示一个初始化 token。
-2. 打开网页，输入 token 并设置管理员密码，密码至少 6 位。
-3. 进入“账号管理”，添加阿里云账号。
-4. 在“系统设置”中设置流量阈值、自动关机和通知方式。
-
-如果忘记了初始化 token，可以查看日志：
-
-```bash
-docker logs ecs-controller 2>&1 | grep '初始化 token'
-```
+1. 打开网页，设置管理员用户名和密码，密码至少 6 位。
+2. 进入“账号管理”，添加阿里云账号。
+3. 在“系统设置”中设置流量阈值、自动关机和通知方式。
 
 ## 阿里云权限
 
@@ -64,13 +65,13 @@ docker logs ecs-controller 2>&1 | grep '初始化 token'
 
 进入“关于 → 版本中心”，点击检查更新即可。
 
-只有 GitHub 上的 Docker 镜像已经准备好时才会更新，部署机器不会构建镜像。更新不会删除账号、配置和流量数据。
+只有 GitHub Release 的对应平台安装包和 SHA256 校验文件准备好时才会更新。后台更新服务会下载、校验、切换版本并重启控制台；健康检查失败时会恢复更新前版本。部署机器不会编译程序，更新不会删除账号、配置和流量数据。
 
 如果旧版本没有在线更新功能，重新运行一次安装命令即可。
 
 ## 安全提醒
 
-- 不要把 AccessKey、AccessKey Secret 或初始化 token 发给别人。
+- 不要把 AccessKey 或 AccessKey Secret 发给别人。
 - 公网访问请使用 HTTPS，不要直接暴露 `43211` 端口。
 - 建议使用 RAM 子账号，不要直接使用阿里云主账号密钥。
 
@@ -80,17 +81,8 @@ docker logs ecs-controller 2>&1 | grep '初始化 token'
 
 公网使用 Passkey 时必须配置 HTTPS；本地测试可以使用 `http://localhost`。
 
-## 请喝咖啡
-
-如果这个工具对你有帮助，欢迎支持项目：
-
-![项目赞赏码](./static/donation-code.jpg)
-
-- USDT-TRC20：`TMBmXngHcKtNo9nLxTCJcGTfNutsbb9rp3`
-- USDT-Polygon / BSC / ERC20 / ArbitrumOne：`0x846ad38ed7159aee70b0ebd8ec39ad2d7b32835b`
-
 ## 相关链接
 
-- 项目地址：https://github.com/Kori1c/ecs-controller
-- 问题反馈：https://github.com/Kori1c/ecs-controller/issues
+- 项目地址：https://github.com/elunez/ecs-controller
+- 问题反馈：https://github.com/elunez/ecs-controller/issues
 - 许可证：[MIT](./LICENSE)
