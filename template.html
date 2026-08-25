@@ -1645,6 +1645,15 @@
             scrollbar-gutter: stable;
         }
 
+        .account-modal:has(.time-picker.open),
+        .account-modal__body:has(.time-picker.open) {
+            overflow: visible;
+        }
+
+        .account-modal__body:has(.time-picker.open) .time-picker.open {
+            z-index: 100;
+        }
+
         .account-modal > .section-head,
         .account-modal > .top-action-row {
             flex: 0 0 auto;
@@ -6624,6 +6633,19 @@
                     tempMinute.value = match ? match[2] : '00';
                 };
 
+                const updatePlacement = () => {
+                    if (!root.value) return;
+                    const triggerRect = root.value.getBoundingClientRect();
+                    const scrollBody = root.value.closest('.account-modal__body');
+                    const boundaryRect = scrollBody?.getBoundingClientRect();
+                    const boundaryTop = boundaryRect?.top ?? 8;
+                    const boundaryBottom = boundaryRect?.bottom ?? (window.innerHeight - 8);
+                    const estimatedHeight = Math.min(280, Math.max(220, window.innerHeight * 0.32 + 74));
+                    const spaceBelow = boundaryBottom - triggerRect.bottom;
+                    const spaceAbove = triggerRect.top - boundaryTop;
+                    dropUp.value = spaceBelow < estimatedHeight && spaceAbove > spaceBelow;
+                };
+
                 const toggle = () => {
                     if (props.disabled) return;
                     if (!open.value) {
@@ -6631,11 +6653,7 @@
                         window.dispatchEvent(new CustomEvent('app-select-opened', {
                             detail: { id: instanceId }
                         }));
-                        requestAnimationFrame(() => {
-                            if (!root.value) return;
-                            const rect = root.value.getBoundingClientRect();
-                            dropUp.value = (window.innerHeight - rect.bottom) < 320 && rect.top > 260;
-                        });
+                        requestAnimationFrame(updatePlacement);
                     }
                     open.value = !open.value;
                 };

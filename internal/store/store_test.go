@@ -222,6 +222,27 @@ func TestUpsertAccountUpdatesRuntimeState(t *testing.T) {
 	}
 }
 
+func TestLoadAccountsByIDDesc(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for _, instanceID := range []string{"i-first", "i-second", "i-third"} {
+		if err := s.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "g", InstanceID: instanceID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	accounts, err := s.LoadAccountsByIDDesc(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 3 || accounts[0].InstanceID != "i-third" || accounts[1].InstanceID != "i-second" || accounts[2].InstanceID != "i-first" {
+		t.Fatalf("accounts are not ordered by id desc: %#v", accounts)
+	}
+}
+
 func TestDisablingScheduledStopClearsItsAutomationBlock(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {

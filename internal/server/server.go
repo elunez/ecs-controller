@@ -740,7 +740,7 @@ func laterTimestamp(current, candidate string) string {
 }
 
 func (s *Server) status(w http.ResponseWriter) {
-	accounts, _ := s.Store.LoadAccounts(false)
+	accounts, _ := s.Store.LoadAccountsByIDDesc(false)
 	credentialInstances, _ := s.Store.CredentialTaskInstances()
 	data := make([]map[string]any, 0)
 	for _, a := range accounts {

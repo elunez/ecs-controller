@@ -880,6 +880,14 @@ func (s *Store) FailJob(jobID, message string) error {
 }
 
 func (s *Store) LoadAccounts(includeDeleted bool) ([]app.Account, error) {
+	return s.loadAccounts(includeDeleted, `COALESCE(region_id,''),COALESCE(remark,''),id`)
+}
+
+func (s *Store) LoadAccountsByIDDesc(includeDeleted bool) ([]app.Account, error) {
+	return s.loadAccounts(includeDeleted, `id DESC`)
+}
+
+func (s *Store) loadAccounts(includeDeleted bool, orderBy string) ([]app.Account, error) {
 	where := "WHERE is_deleted = 0"
 	if includeDeleted {
 		where = ""
@@ -893,7 +901,7 @@ func (s *Store) LoadAccounts(includeDeleted bool) ([]app.Account, error) {
 		COALESCE(internet_max_bandwidth_out,0),COALESCE(public_ip,''),COALESCE(public_ip_mode,'ecs_public_ip'),COALESCE(eip_allocation_id,''),COALESCE(eip_address,''),COALESCE(eip_managed,0),
 		COALESCE(private_ip,''),COALESCE(cpu,0),COALESCE(memory,0),COALESCE(os_name,''),COALESCE(stopped_mode,''),COALESCE(health_status,'Unknown'),
 		COALESCE(traffic_api_status,'ok'),COALESCE(traffic_api_message,''),COALESCE(protection_suspended,0),COALESCE(protection_suspend_reason,''),COALESCE(protection_suspend_notified_at,0),COALESCE(is_deleted,0)
-		FROM accounts ` + where + ` ORDER BY COALESCE(region_id,''),COALESCE(remark,''),id`)
+		FROM accounts ` + where + ` ORDER BY ` + orderBy)
 	if err != nil {
 		return nil, err
 	}
