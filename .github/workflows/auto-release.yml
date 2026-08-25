@@ -28,13 +28,21 @@ jobs:
           go-version: '1.26.x'
           cache: true
 
+      - name: Remove legacy release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v1.17.1 >/dev/null 2>&1; then
+            gh release delete v1.17.1 --yes
+          fi
+
       - name: Generate next version
         id: version
         shell: bash
         run: |
           latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1)"
           if [[ -z "$latest_tag" ]]; then
-            next_tag="v1.17.1"
+            next_tag="v1.0.0"
           elif [[ "$latest_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
             next_tag="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
           else
