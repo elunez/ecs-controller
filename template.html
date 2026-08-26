@@ -3043,7 +3043,7 @@
 
         .settings-nav {
             display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 10px;
         }
 
@@ -5631,69 +5631,6 @@
                                 </div>
                             </div>
 
-                            <div v-if="currentSettingsTab === 'runtime'" class="metric-card runtime-center">
-                                <div class="runtime-center__head">
-                                    <div>
-                                        <p class="subtle-label">运行状态</p>
-                                        <h3 class="mt-1 text-lg font-bold">后台任务时间轴</h3>
-                                        <p class="mt-1 text-xs leading-5 text-[var(--muted)]">查看监控、同步、轮转、通知和任务队列的最近执行结果。</p>
-                                    </div>
-                                    <div class="flex items-center gap-2">
-                                        <div class="runtime-center__summary" :data-state="runtimeStatus.overall">
-                                            <span class="runtime-center__summary-dot"></span>
-                                            <span>{{ runtimeOverallText }}</span>
-                                        </div>
-                                        <button type="button" class="ghost-button" :disabled="runtimeLoading" @click="fetchRuntimeStatus">
-                                            {{ runtimeLoading ? '刷新中' : '刷新' }}
-                                        </button>
-                                    </div>
-                                </div>
-
-                                <div v-if="runtimeStatus.components.length" class="runtime-timeline">
-                                    <article
-                                        v-for="component in runtimeStatus.components"
-                                        :key="component.key"
-                                        class="runtime-task"
-                                        :data-tone="runtimeStatusMeta(component.status).tone"
-                                    >
-                                        <span class="runtime-task__marker" aria-hidden="true"></span>
-                                        <div>
-                                            <div class="runtime-task__name">{{ component.label }}</div>
-                                            <span class="runtime-task__state">{{ runtimeStatusMeta(component.status).label }}</span>
-                                        </div>
-                                        <div class="runtime-task__detail">
-                                            <div>{{ component.detail || '尚无执行记录' }}</div>
-                                            <div v-if="component.last_error" class="runtime-task__error" :title="component.last_error">{{ component.last_error }}</div>
-                                        </div>
-                                        <div class="runtime-task__times">
-                                            <span>最近成功 <strong>{{ runtimeFormatDateTime(component.last_success_at) }}</strong></span>
-                                            <span>执行耗时 <strong>{{ runtimeFormatDuration(component.last_duration_ms) }}</strong></span>
-                                            <span>最近启动 <strong>{{ runtimeFormatDateTime(component.last_started_at) }}</strong></span>
-                                            <span>下次执行 <strong>{{ runtimeFormatDateTime(component.next_run_at) }}</strong></span>
-                                        </div>
-                                    </article>
-                                </div>
-                                <div v-else class="py-8 text-center text-sm text-[var(--muted)]">
-                                    {{ runtimeLoading ? '正在读取运行状态…' : '后台任务尚未生成运行记录。' }}
-                                </div>
-
-                                <div class="runtime-jobs">
-                                    <span class="runtime-jobs__item">等待<strong>{{ runtimeStatus.job_counts.queued || 0 }}</strong></span>
-                                    <span class="runtime-jobs__item">执行中<strong>{{ runtimeStatus.job_counts.running || 0 }}</strong></span>
-                                    <span class="runtime-jobs__item">重试<strong>{{ runtimeStatus.job_counts.retry || 0 }}</strong></span>
-                                    <span class="runtime-jobs__item">失败<strong>{{ runtimeStatus.job_counts.failed || 0 }}</strong></span>
-                                </div>
-                                <div v-if="runtimeStatus.failed_jobs.length" class="runtime-failed-jobs">
-                                    <div v-for="job in runtimeStatus.failed_jobs" :key="job.job_id" class="runtime-failed-job">
-                                        <div class="runtime-failed-job__name">{{ runtimeJobLabel(job.kind) }} · {{ job.entity_key }}</div>
-                                        <div class="runtime-failed-job__error" :title="job.last_error">{{ job.last_error || '任务执行失败' }}</div>
-                                        <button type="button" class="ghost-button" :disabled="retryingRuntimeJob === job.job_id" @click="retryRuntimeJob(job)">
-                                            {{ retryingRuntimeJob === job.job_id ? '入队中' : '重新执行' }}
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-
                             <div v-if="currentSettingsTab === 'notifications'" class="metric-card">
                                 <div class="tab-pill-group">
                                     <button @click="currentNotifyTab = 'telegram'" class="ghost-button" :class="{ 'text-dark-button': currentNotifyTab === 'telegram' }">Telegram</button>
@@ -5814,6 +5751,70 @@
 
                     </section>
 
+                    <section v-if="currentMenu === 'runtime' && isAdmin" class="glass-panel section-panel">
+                        <div class="metric-card runtime-center">
+                            <div class="runtime-center__head">
+                                <div>
+                                    <h2 class="section-title" style="margin-bottom:0">运行状态</h2>
+                                    <p class="mt-1 text-xs leading-5 text-[var(--muted)]">查看监控、同步、轮转、通知和任务队列的最近执行结果。</p>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <div class="runtime-center__summary" :data-state="runtimeStatus.overall">
+                                        <span class="runtime-center__summary-dot"></span>
+                                        <span>{{ runtimeOverallText }}</span>
+                                    </div>
+                                    <button type="button" class="ghost-button" :disabled="runtimeLoading" @click="fetchRuntimeStatus">
+                                        {{ runtimeLoading ? '刷新中' : '刷新' }}
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div v-if="runtimeStatus.components.length" class="runtime-timeline">
+                                <article
+                                    v-for="component in runtimeStatus.components"
+                                    :key="component.key"
+                                    class="runtime-task"
+                                    :data-tone="runtimeStatusMeta(component.status).tone"
+                                >
+                                    <span class="runtime-task__marker" aria-hidden="true"></span>
+                                    <div>
+                                        <div class="runtime-task__name">{{ component.label }}</div>
+                                        <span class="runtime-task__state">{{ runtimeStatusMeta(component.status).label }}</span>
+                                    </div>
+                                    <div class="runtime-task__detail">
+                                        <div>{{ component.detail || '尚无执行记录' }}</div>
+                                        <div v-if="component.last_error" class="runtime-task__error" :title="component.last_error">{{ component.last_error }}</div>
+                                    </div>
+                                    <div class="runtime-task__times">
+                                        <span>最近成功 <strong>{{ runtimeFormatDateTime(component.last_success_at) }}</strong></span>
+                                        <span>执行耗时 <strong>{{ runtimeFormatDuration(component.last_duration_ms) }}</strong></span>
+                                        <span>最近启动 <strong>{{ runtimeFormatDateTime(component.last_started_at) }}</strong></span>
+                                        <span>下次执行 <strong>{{ runtimeFormatDateTime(component.next_run_at) }}</strong></span>
+                                    </div>
+                                </article>
+                            </div>
+                            <div v-else class="py-8 text-center text-sm text-[var(--muted)]">
+                                {{ runtimeLoading ? '正在读取运行状态…' : '后台任务尚未生成运行记录。' }}
+                            </div>
+
+                            <div class="runtime-jobs">
+                                <span class="runtime-jobs__item">等待<strong>{{ runtimeStatus.job_counts.queued || 0 }}</strong></span>
+                                <span class="runtime-jobs__item">执行中<strong>{{ runtimeStatus.job_counts.running || 0 }}</strong></span>
+                                <span class="runtime-jobs__item">重试<strong>{{ runtimeStatus.job_counts.retry || 0 }}</strong></span>
+                                <span class="runtime-jobs__item">失败<strong>{{ runtimeStatus.job_counts.failed || 0 }}</strong></span>
+                            </div>
+                            <div v-if="runtimeStatus.failed_jobs.length" class="runtime-failed-jobs">
+                                <div v-for="job in runtimeStatus.failed_jobs" :key="job.job_id" class="runtime-failed-job">
+                                    <div class="runtime-failed-job__name">{{ runtimeJobLabel(job.kind) }} · {{ job.entity_key }}</div>
+                                    <div class="runtime-failed-job__error" :title="job.last_error">{{ job.last_error || '任务执行失败' }}</div>
+                                    <button type="button" class="ghost-button" :disabled="retryingRuntimeJob === job.job_id" @click="retryRuntimeJob(job)">
+                                        {{ retryingRuntimeJob === job.job_id ? '入队中' : '重新执行' }}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
                     <section v-if="currentMenu === 'logs' && isAdmin" class="glass-panel section-panel">
                         <div class="section-head">
                             <div>
@@ -5823,7 +5824,7 @@
                                 <button @click="currentLogTab = 'action'; fetchLogs()" class="ghost-button" :class="{ 'text-dark-button': currentLogTab === 'action' }">动作日志</button>
                                 <button @click="currentLogTab = 'heartbeat'; fetchLogs()" class="ghost-button" :class="{ 'text-dark-button': currentLogTab === 'heartbeat' }">心跳日志</button>
 								<button @click="currentLogTab = 'audit'; fetchLogs()" class="ghost-button" :class="{ 'text-dark-button': currentLogTab === 'audit' }">操作审计</button>
-                                <button v-if="currentLogTab !== 'audit'" @click="clearLogs" class="danger-button">清空</button>
+                                <button @click="clearLogs" class="danger-button" :disabled="currentLogTab === 'audit'">清空</button>
                             </div>
                         </div>
 
@@ -5866,7 +5867,7 @@
 								<p v-if="log.error" class="audit-card__error">{{ log.error }}</p>
 							</article>
 
-                            <div v-if="systemLogs.length === 0" class="metric-card">
+                            <div v-if="systemLogs.length === 0" class="metric-card" style="margin-top:10px">
                                 <p class="text-center text-sm text-[var(--muted)]">当前没有日志记录。</p>
                             </div>
                         </div>
@@ -7267,8 +7268,8 @@
                     }
                 };
                 const savedNavigation = readNavigationState();
-                const validMenus = ['manage', 'groups', 'accounts', 'settings', 'logs', 'about'];
-                const validSettingsTabs = ['instance', 'runtime', 'notifications', 'global'];
+                const validMenus = ['manage', 'groups', 'accounts', 'settings', 'runtime', 'logs', 'about'];
+                const validSettingsTabs = ['instance', 'notifications', 'global'];
                 const validNotifyTabs = ['telegram', 'email', 'webhook'];
                 const validLogTabs = ['action', 'heartbeat', 'audit'];
                 const currentMenu = ref(validMenus.includes(savedNavigation.menu) ? savedNavigation.menu : 'manage');
@@ -7971,7 +7972,6 @@
 
                 const settingsItems = [
                     { key: 'instance', label: '实例配置', description: '阈值、同步与费用' },
-                    { key: 'runtime', label: '运行状态', description: '监控、轮转与任务' },
                     { key: 'notifications', label: '通知中心', description: '邮件、Telegram、回调' },
                     { key: 'global', label: '全局配置', description: '品牌、账号与安全' }
                 ];
@@ -8004,6 +8004,12 @@
                                 label: '系统设置',
                                 description: '运行参数与通知',
                                 icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.08V21a2 2 0 0 1-4 0v-.09a1.7 1.7 0 0 0-.4-1.08 1.7 1.7 0 0 0-1-.6 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.08-.4H2.9a2 2 0 0 1 0-4H3a1.7 1.7 0 0 0 1.08-.4 1.7 1.7 0 0 0 .6-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.08V2.9a2 2 0 0 1 4 0V3a1.7 1.7 0 0 0 .4 1.08 1.7 1.7 0 0 0 1 .6 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9a1.7 1.7 0 0 0 .6 1 1.7 1.7 0 0 0 1.08.4h.09a2 2 0 0 1 0 4h-.09a1.7 1.7 0 0 0-1.08.4 1.7 1.7 0 0 0-.6 1Z"/></svg>'
+                            },
+                            {
+                                key: 'runtime',
+                                label: '运行状态',
+                                description: '监控、轮转与任务',
+                                icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>'
                             },
                             {
                                 key: 'logs',
@@ -8597,7 +8603,7 @@
 
                 const startRuntimePolling = () => {
                     stopRuntimePolling();
-                    if (!initialized.value || criticalError.value || currentMenu.value !== 'settings' || currentSettingsTab.value !== 'runtime' || !isAdmin.value) {
+                    if (!initialized.value || criticalError.value || currentMenu.value !== 'runtime' || !isAdmin.value) {
                         return;
                     }
                     fetchRuntimeStatus();
@@ -10091,7 +10097,7 @@
                         stopUpdatePolling();
                     }
 
-                    if (menu === 'settings' && currentSettingsTab.value === 'runtime' && isAdmin.value) {
+                    if (menu === 'runtime' && isAdmin.value) {
                         startRuntimePolling();
                     } else {
                         stopRuntimePolling();
@@ -10099,7 +10105,6 @@
                 };
 
                 watch(currentMenu, syncCurrentMenu);
-                watch(currentSettingsTab, () => startRuntimePolling());
                 watch([currentMenu, currentSettingsTab, currentNotifyTab, currentLogTab], persistNavigationState);
 
                 watch(isAdmin, async (value) => {
