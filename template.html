@@ -3066,6 +3066,15 @@
         .manage-toolbar .glass-input { flex: 1 1 260px; min-width: 220px; }
         .manage-toolbar .solid-button { flex: 0 0 auto; min-width: 104px; }
 
+        .manage-toolbar .glass-input,
+        .manage-toolbar .select-trigger,
+        .rotation-group-toolbar .glass-input,
+        .account-list-toolbar .glass-input,
+        .account-list-toolbar .select-trigger {
+            min-height: 40px;
+            padding: 0.45rem 0.75rem;
+        }
+
         .manage-head-actions {
             display: flex;
             align-items: center;
@@ -5197,7 +5206,7 @@
                             </div>
                             <button @click="openCreateRotationGroup" class="ghost-button">新增分组</button>
 
-                            <div class="toolbar-grid" style="width: 100%;">
+                            <div class="toolbar-grid rotation-group-toolbar" style="width: 100%;">
                                 <input v-model="rotationGroupSearch" class="glass-input" placeholder="搜索分组名称、域名、DNS 服务商或关联实例">
                             </div>
                         </div>
