@@ -40,8 +40,18 @@ func (w *Worker) TelegramControl(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			w.Store.AddLog("error", "Telegram 控制拉取消息失败: "+err.Error())
-			if !sleepContext(ctx, 5*time.Second) {
+			wait := 5 * time.Second
+			if telegramConflictError(err) {
+				now := time.Now().Unix()
+				if now-w.telegramConflictLastLog >= 600 {
+					w.telegramConflictLastLog = now
+					w.Store.AddLog("warning", "Telegram 控制暂时暂停：检测到其他程序正在使用同一机器人拉取消息，请确保只运行一个控制台实例。")
+				}
+				wait = 30 * time.Second
+			} else {
+				w.Store.AddLog("error", "Telegram 控制拉取消息失败: "+err.Error())
+			}
+			if !sleepContext(ctx, wait) {
 				return
 			}
 			continue
@@ -58,6 +68,14 @@ func (w *Worker) TelegramControl(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func telegramConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "conflict") && strings.Contains(message, "getupdates")
 }
 
 func (w *Worker) telegramOffset(token string) int64 {

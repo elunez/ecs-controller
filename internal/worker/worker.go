@@ -17,10 +17,11 @@ import (
 )
 
 type Worker struct {
-	Store         *store.Store
-	CloudFactory  func(app.AccountGroup) cloud.Client
-	InventorySync func(context.Context) (int, error)
-	Log           *log.Logger
+	Store                   *store.Store
+	CloudFactory            func(app.AccountGroup) cloud.Client
+	InventorySync           func(context.Context) (int, error)
+	Log                     *log.Logger
+	telegramConflictLastLog int64
 }
 
 func (w *Worker) cloudClient(group app.AccountGroup) cloud.Client {
@@ -639,6 +640,7 @@ func (w *Worker) Run(ctx context.Context) {
 					}
 				}
 				_ = w.Store.FailJob(job.JobID, err.Error())
+				w.Store.AddLog("error", fmt.Sprintf("后台任务最终失败 [%s/%s]（已重试 %d 次）：%s", job.Kind, job.EntityKey, job.Attempts, err.Error()))
 				w.finishRuntime(runtimeJobQueue, started, "任务已达到最大重试次数", time.Time{}, err)
 				action, entityType, summary := "job_execute", "job", "后台任务执行失败"
 				if job.Kind == "create_ecs" {

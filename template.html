@@ -5803,15 +5803,6 @@
                                 <span class="runtime-jobs__item">重试<strong>{{ runtimeStatus.job_counts.retry || 0 }}</strong></span>
                                 <span class="runtime-jobs__item">失败<strong>{{ runtimeStatus.job_counts.failed || 0 }}</strong></span>
                             </div>
-                            <div v-if="runtimeStatus.failed_jobs.length" class="runtime-failed-jobs">
-                                <div v-for="job in runtimeStatus.failed_jobs" :key="job.job_id" class="runtime-failed-job">
-                                    <div class="runtime-failed-job__name">{{ runtimeJobLabel(job.kind) }} · {{ job.entity_key }}</div>
-                                    <div class="runtime-failed-job__error" :title="job.last_error">{{ job.last_error || '任务执行失败' }}</div>
-                                    <button type="button" class="ghost-button" :disabled="retryingRuntimeJob === job.job_id" @click="retryRuntimeJob(job)">
-                                        {{ retryingRuntimeJob === job.job_id ? '入队中' : '重新执行' }}
-                                    </button>
-                                </div>
-                            </div>
                         </div>
                     </section>
 
@@ -7234,7 +7225,6 @@
 				let auditSearchTimer = null;
                 const runtimeStatus = ref({ overall: 'working', components: [], job_counts: {}, failed_jobs: [] });
                 const runtimeLoading = ref(false);
-                const retryingRuntimeJob = ref('');
                 const runtimeStatusUI = window.ECSRuntimeStatusUI;
                 const runtimeStatusMeta = (status) => runtimeStatusUI.metaFor(status);
                 const runtimeFormatDateTime = (value) => runtimeStatusUI.formatDateTime(value);
@@ -8572,32 +8562,6 @@
                     if (runtimeInterval) {
                         clearInterval(runtimeInterval);
                         runtimeInterval = null;
-                    }
-                };
-
-                const runtimeJobLabel = (kind) => ({
-                    create_ecs: '创建 ECS',
-                    delete_instance: '释放实例'
-                }[kind] || kind || '后台任务');
-
-                const retryRuntimeJob = async (job) => {
-                    if (!job?.job_id || retryingRuntimeJob.value) return;
-                    retryingRuntimeJob.value = job.job_id;
-                    try {
-                        const res = await fetch('index.php?action=retry_runtime_job', {
-                            method: 'POST',
-                            body: JSON.stringify({ jobId: job.job_id })
-                        });
-                        const data = await res.json();
-                        if (!res.ok || data.error) {
-                            throw new Error(data.error || '任务重新入队失败');
-                        }
-                        openAlert('失败任务已重新进入后台队列', 'success');
-                        await fetchRuntimeStatus();
-                    } catch (error) {
-                        openAlert(error.message || '任务重新入队失败', 'error');
-                    } finally {
-                        retryingRuntimeJob.value = '';
                     }
                 };
 
@@ -10260,13 +10224,10 @@
 					formatAvailableDays,
                     runtimeStatus,
                     runtimeLoading,
-                    retryingRuntimeJob,
                     runtimeOverallText,
                     runtimeStatusMeta,
                     runtimeFormatDateTime,
                     runtimeFormatDuration,
-                    runtimeJobLabel,
-                    retryRuntimeJob,
                     updateInfo,
                     updateState,
                     updateReloadPending,

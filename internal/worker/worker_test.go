@@ -1022,6 +1022,15 @@ func TestTelegramSettingEnabledAcceptsLegacyValues(t *testing.T) {
 	}
 }
 
+func TestTelegramConflictError(t *testing.T) {
+	if !telegramConflictError(errors.New("Telegram: Conflict: terminated by other getUpdates request")) {
+		t.Fatal("Telegram getUpdates conflict was not detected")
+	}
+	if telegramConflictError(errors.New("Telegram: Bad Request: chat not found")) {
+		t.Fatal("non-conflict Telegram error was misclassified")
+	}
+}
+
 func TestTelegramOffsetResetsWhenBotTokenChanges(t *testing.T) {
 	s, err := store.Open(t.TempDir())
 	if err != nil {
