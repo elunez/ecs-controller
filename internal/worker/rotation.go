@@ -38,12 +38,14 @@ func (w *Worker) runRotationSchedule(ctx context.Context, client cloud.Client, a
 		case "Stopped":
 			if err := client.StartInstance(ctx, account.RegionID, account.InstanceID); err != nil {
 				w.rotationAlert(ctx, group, account, &state, "分组提前开机失败: "+err.Error())
+				w.audit(app.AuditSourceRotation, "rotation_advance_start", "instance", auditAccountID(*account), "分组提前开机", err)
 			} else {
 				account.InstanceStatus = "Starting"
 				account.ScheduleStopActive = false
 				state.LastStartDate = startDate
 				state.LastError = ""
 				w.Store.AddLog("info", fmt.Sprintf("分组 [%s] 提前启动实例: %s", group.Name, account.InstanceID))
+				w.audit(app.AuditSourceRotation, "rotation_advance_start", "instance", auditAccountID(*account), "分组提前开机", nil)
 			}
 		case "Running", "Starting", "Pending":
 			state.LastStartDate = startDate
@@ -60,13 +62,17 @@ func (w *Worker) runRotationSchedule(ctx context.Context, client cloud.Client, a
 			address = account.EIPAddress
 		}
 		if address == "" {
-			w.rotationAlert(ctx, group, account, &state, "分组 DDNS 更新失败: 实例没有公网 IP")
+			dnsErr := fmt.Errorf("实例没有公网 IP")
+			w.rotationAlert(ctx, group, account, &state, "分组 DDNS 更新失败: "+dnsErr.Error())
+			w.audit(app.AuditSourceRotation, "ddns_update", "rotation_group", group.ID, "更新分组域名解析", dnsErr)
 		} else if err := notify.UpdateDNSRecord(ctx, rotationDNSConfig(*group), address); err != nil {
 			w.rotationAlert(ctx, group, account, &state, "分组 DDNS 更新失败: "+err.Error())
+			w.audit(app.AuditSourceRotation, "ddns_update", "rotation_group", group.ID, "更新分组域名解析", err)
 		} else {
 			state.DNSUpdatedDate = state.LastStartDate
 			state.LastError = ""
 			w.Store.AddLog("info", fmt.Sprintf("分组 [%s] DDNS 已切换 %s -> %s", group.Name, group.Domain, address))
+			w.audit(app.AuditSourceRotation, "ddns_update", "rotation_group", group.ID, "更新分组域名解析", nil)
 		}
 	}
 
@@ -75,12 +81,14 @@ func (w *Worker) runRotationSchedule(ctx context.Context, client cloud.Client, a
 		case "Running":
 			if err := client.StopInstance(ctx, account.RegionID, account.InstanceID, shutdownMode); err != nil {
 				w.rotationAlert(ctx, group, account, &state, "分组延后关机失败: "+err.Error())
+				w.audit(app.AuditSourceRotation, "rotation_delayed_stop", "instance", auditAccountID(*account), "分组延后关机", err)
 			} else {
 				account.InstanceStatus = "Stopping"
 				account.ScheduleStopActive = true
 				state.LastStopDate = stopDate
 				w.Store.AddLog("info", fmt.Sprintf("分组 [%s] 延后关闭实例: %s", group.Name, account.InstanceID))
 				w.dispatchEvent(ctx, statusEvent(*account, "Running", "Stopping", fmt.Sprintf("分组 %s 已到延后关机时间。", group.Name)))
+				w.audit(app.AuditSourceRotation, "rotation_delayed_stop", "instance", auditAccountID(*account), "分组延后关机", nil)
 			}
 		case "Stopped", "Stopping":
 			state.LastStopDate = stopDate

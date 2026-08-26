@@ -192,6 +192,12 @@ type BillingDetailClient interface {
 	GetBillingDetails(context.Context, string, string, string) ([]BillingDetail, error)
 }
 
+// MonthlyBillingDetailClient supplies one billing cycle in a single request.
+// It is used by cost analysis to avoid issuing one API request per calendar day.
+type MonthlyBillingDetailClient interface {
+	GetMonthlyBillingDetails(context.Context, string, string) ([]BillingDetail, error)
+}
+
 // BillingResourceClient is optional. It provides current disk and EIP details
 // without making an unavailable inventory API block historical billing data.
 type BillingResourceClient interface {
@@ -826,6 +832,32 @@ func (s *Service) GetBillingDetails(ctx context.Context, siteType, billingCycle,
 		return nil, instanceErr
 	}
 	// A successful instance-bill request with no rows is still a valid empty result.
+	return details, nil
+}
+
+func (s *Service) GetMonthlyBillingDetails(ctx context.Context, siteType, billingCycle string) ([]BillingDetail, error) {
+	if _, err := time.Parse("2006-01", billingCycle); err != nil {
+		return nil, fmt.Errorf("invalid billing cycle %q", billingCycle)
+	}
+	splitDetails, splitErr := s.getPagedBillingDetails(ctx, siteType, "DescribeSplitItemBill", map[string]string{
+		"BillingCycle":     billingCycle,
+		"Granularity":      "MONTHLY",
+		"IsHideZeroCharge": "true",
+		"MaxResults":       "300",
+	}, billingCycle+"-01")
+	if splitErr == nil && len(splitDetails) > 0 {
+		return splitDetails, nil
+	}
+	details, instanceErr := s.getPagedBillingDetails(ctx, siteType, "DescribeInstanceBill", map[string]string{
+		"BillingCycle":     billingCycle,
+		"Granularity":      "MONTHLY",
+		"IsBillingItem":    "true",
+		"IsHideZeroCharge": "true",
+		"MaxResults":       "300",
+	}, billingCycle+"-01")
+	if instanceErr != nil {
+		return nil, instanceErr
+	}
 	return details, nil
 }
 

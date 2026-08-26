@@ -45,7 +45,7 @@ fi
 
 install_dependencies() {
     missing=0
-    for command_name in curl tar awk sed; do
+    for command_name in curl tar awk sed openssl; do
         command -v "$command_name" >/dev/null 2>&1 || missing=1
     done
     if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -56,15 +56,15 @@ install_dependencies() {
     echo "正在安装 curl、证书和解压工具..."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl tar coreutils
+        DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl tar coreutils openssl
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache ca-certificates curl tar coreutils
+        apk add --no-cache ca-certificates curl tar coreutils openssl
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y ca-certificates curl tar coreutils
+        dnf install -y ca-certificates curl tar coreutils openssl
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y ca-certificates curl tar coreutils
+        yum install -y ca-certificates curl tar coreutils openssl
     else
-        echo "无法自动安装依赖，请先安装 curl、ca-certificates、tar 和 sha256sum。" >&2
+        echo "无法自动安装依赖，请先安装 curl、ca-certificates、tar、openssl 和 sha256sum。" >&2
         exit 1
     fi
 }
@@ -227,11 +227,24 @@ work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT INT TERM
 archive=$work_dir/$asset
 checksums=$work_dir/checksums.txt
+signature=$work_dir/checksums.txt.sig
+public_key=$work_dir/release-public-key.pem
 extracted=$work_dir/release
 
 echo "正在下载 $version（Linux/$arch）..."
 curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "$archive" "$base_url/$asset"
 curl -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$checksums" "$base_url/checksums.txt"
+curl -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$signature" "$base_url/checksums.txt.sig"
+
+cat >"$public_key" <<'EOF'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAm9CigRc4uc8jpEdkJBYUEtJ4T41AcVl6VQJcqAOiUkw=
+-----END PUBLIC KEY-----
+EOF
+if ! openssl pkeyutl -verify -pubin -inkey "$public_key" -rawin -in "$checksums" -sigfile "$signature" >/dev/null 2>&1; then
+    echo "发布清单 Ed25519 签名校验失败，安装已停止。" >&2
+    exit 1
+fi
 
 expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$checksums")
 actual=$(sha256_file "$archive")
@@ -307,6 +320,14 @@ if ! wait_for_health; then
     fi
     exit 1
 fi
+
+# 健康检查通过后再清理旧版本，始终保留当前版本和一个回滚版本。
+for candidate in "$releases_dir"/* "$releases_dir"/.replaced-*; do
+    [ -d "$candidate" ] || continue
+    [ "$candidate" = "$release_dir" ] && continue
+    [ -n "$previous_release" ] && [ "$candidate" = "$previous_release" ] && continue
+    rm -rf "$candidate"
+done
 
 echo "ECS 控制台安装完成：$version"
 echo "访问地址：http://$listen_addr"

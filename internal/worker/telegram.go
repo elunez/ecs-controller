@@ -197,15 +197,19 @@ func (w *Worker) handleTelegramCallback(ctx context.Context, client *notify.Tele
 		id := int64(intValueAt(data, 2))
 		page := maxInt(1, intValueAt(data, 3))
 		if err := w.refreshTelegramAccount(ctx, id); err != nil {
+			w.audit(app.AuditSourceTelegram, "instance_refresh", "instance", strconv.FormatInt(id, 10), "Telegram 刷新实例", err)
 			return edit("❌ 刷新失败："+err.Error(), w.instanceKeyboard(id, page))
 		}
+		w.audit(app.AuditSourceTelegram, "instance_refresh", "instance", strconv.FormatInt(id, 10), "Telegram 刷新实例", nil)
 		return edit(w.telegramInstance(id), w.instanceKeyboard(id, page))
 	case "start", "stop":
 		id := int64(intValueAt(data, 2))
 		page := maxInt(1, intValueAt(data, 3))
 		if err := w.controlTelegramAccount(ctx, id, action); err != nil {
+			w.audit(app.AuditSourceTelegram, "instance_"+action, "instance", strconv.FormatInt(id, 10), "Telegram "+actionLabel(action), err)
 			return edit("❌ "+actionLabel(action)+"失败："+err.Error(), w.instanceKeyboard(id, page))
 		}
+		w.audit(app.AuditSourceTelegram, "instance_"+action, "instance", strconv.FormatInt(id, 10), "Telegram "+actionLabel(action), nil)
 		return edit("✅ "+actionLabel(action)+"指令已提交。", w.instanceKeyboard(id, page))
 	case "release":
 		id := int64(intValueAt(data, 2))
@@ -231,8 +235,10 @@ func (w *Worker) handleTelegramCallback(ctx context.Context, client *notify.Tele
 			return edit("⏱️ 释放确认已失效，请重新发起释放。", w.mainKeyboard())
 		}
 		if err := w.enqueueTelegramDelete(record.AccountID); err != nil {
+			w.audit(app.AuditSourceTelegram, "instance_release_submit", "instance", strconv.FormatInt(record.AccountID, 10), "Telegram 提交实例释放", err)
 			return edit("❌ 释放指令提交失败："+err.Error(), w.mainKeyboard())
 		}
+		w.audit(app.AuditSourceTelegram, "instance_release_submit", "instance", strconv.FormatInt(record.AccountID, 10), "Telegram 提交实例释放", nil)
 		return edit("🗑️ 释放指令已提交\n\n后台队列会继续回收 ECS、EIP 和 DDNS。", w.mainKeyboard())
 	case "cancel":
 		if len(data) >= 3 {

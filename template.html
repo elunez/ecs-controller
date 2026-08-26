@@ -11,6 +11,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="static/tailwind-compiled.css?v=__ASSET_VERSION__">
+    <link rel="stylesheet" href="static/runtime-status.css?v=__ASSET_VERSION__">
     <script>
         // 自动跟随系统主题
         (function() {
@@ -2002,6 +2003,77 @@
             transform: translateY(-1px);
         }
 
+		.billing-analysis {
+			margin-top: 10px;
+			border: 1px solid color-mix(in srgb, var(--line) 82%, transparent);
+			border-radius: 16px;
+			background: color-mix(in srgb, var(--panel-strong) 64%, transparent);
+			padding: 14px;
+		}
+
+		.billing-analysis__head {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 12px;
+			margin-bottom: 10px;
+		}
+
+		.billing-analysis__grid {
+			display: grid;
+			grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+			gap: 10px;
+		}
+
+		.billing-analysis-card {
+			border: 1px solid var(--line);
+			border-radius: 14px;
+			background: var(--panel-strong);
+			padding: 12px 14px;
+		}
+
+		.billing-analysis-card__head,
+		.billing-analysis-card__numbers {
+			display: flex;
+			align-items: baseline;
+			justify-content: space-between;
+			gap: 12px;
+		}
+
+		.billing-analysis-card__numbers {
+			margin-top: 10px;
+			align-items: flex-start;
+		}
+
+		.billing-analysis-card__primary {
+			font-size: 1.05rem;
+			font-weight: 850;
+			font-variant-numeric: tabular-nums;
+		}
+
+		.billing-analysis-card__meta {
+			color: var(--muted);
+			font-size: .72rem;
+			line-height: 1.55;
+			text-align: right;
+		}
+
+		.billing-category-list {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 6px;
+			margin-top: 10px;
+		}
+
+		.billing-category-chip {
+			border-radius: 999px;
+			background: var(--accent-light);
+			color: var(--accent-strong);
+			padding: 4px 8px;
+			font-size: .68rem;
+			font-weight: 750;
+		}
+
         .billing-modal {
             width: min(940px, 100%);
             height: min(760px, calc(100vh - 32px));
@@ -2971,7 +3043,7 @@
 
         .settings-nav {
             display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
+            grid-template-columns: repeat(4, minmax(0, 1fr));
             gap: 10px;
         }
 
@@ -4145,6 +4217,46 @@
             padding: 1rem !important;
         }
 
+		.audit-toolbar {
+			display: grid;
+			grid-template-columns: minmax(150px, .7fr) minmax(180px, .9fr) minmax(220px, 1.5fr);
+			gap: 10px;
+			margin-top: 10px;
+		}
+
+		.audit-card__meta {
+			display: flex;
+			flex-wrap: wrap;
+			align-items: center;
+			gap: 8px 12px;
+			color: var(--muted);
+			font-size: .75rem;
+		}
+
+		.audit-card__request {
+			font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+		}
+
+		.audit-card__summary {
+			margin-top: 10px;
+			font-size: .85rem;
+			font-weight: 650;
+			line-height: 1.55;
+		}
+
+		.audit-card__error {
+			margin-top: 6px;
+			color: var(--danger);
+			font-size: .78rem;
+			line-height: 1.5;
+		}
+
+		@media (max-width: 760px) {
+			.audit-toolbar {
+				grid-template-columns: 1fr;
+			}
+		}
+
         .desktop-visible {
             display: block;
         }
@@ -5131,6 +5243,42 @@
                             </div>
                         </div>
 
+						<div v-if="config.enable_billing" class="billing-analysis">
+							<div class="billing-analysis__head">
+								<div>
+									<strong>本月费用分析</strong>
+									<p class="mt-1 text-xs text-[var(--muted)]">按云账号汇总；预测按本月日均消费计算，费用阈值仅通知。</p>
+								</div>
+								<button class="ghost-button compact-button" :disabled="billingAnalysisLoading" @click="fetchBillingAnalysis(true)">{{ billingAnalysisLoading ? '查询中' : '刷新费用' }}</button>
+							</div>
+							<div v-if="billingAnalysisLoading && !billingAnalysis.accounts.length" class="text-sm text-[var(--muted)]">正在查询费用数据...</div>
+							<div v-else-if="billingAnalysisError" class="text-sm text-red-600">{{ billingAnalysisError }}</div>
+							<div v-else-if="!billingAnalysis.accounts.length" class="text-sm text-[var(--muted)]">暂无可分析的云账号。</div>
+							<div v-else class="billing-analysis__grid">
+								<article v-for="item in billingAnalysis.accounts" :key="item.group_key" class="billing-analysis-card">
+									<div class="billing-analysis-card__head">
+										<strong>{{ item.label }}</strong>
+										<span class="text-xs text-[var(--muted)]">{{ item.currency }}</span>
+									</div>
+									<div class="billing-analysis-card__numbers">
+										<div>
+											<div class="text-xs text-[var(--muted)]">本月累计</div>
+											<div class="billing-analysis-card__primary">{{ formatCurrencyValue(item.monthly_cost, item.currency) }}</div>
+										</div>
+										<div class="billing-analysis-card__meta">
+											<div>月底预测 {{ formatCurrencyValue(item.forecast, item.currency) }}</div>
+											<div>余额 {{ formatCurrencyValue(item.balance, item.currency) }}</div>
+											<div>{{ item.available_days == null ? '暂无可用天数预测' : `预计可用 ${formatAvailableDays(item.available_days)}` }}</div>
+										</div>
+									</div>
+									<div v-if="item.categories?.length" class="billing-category-list">
+										<span v-for="category in item.categories" :key="category.key" class="billing-category-chip">{{ category.label }} {{ formatCurrencyValue(category.amount, item.currency) }}</span>
+									</div>
+									<p v-if="item.error" class="mt-2 text-xs text-amber-700">{{ item.error }}</p>
+								</article>
+							</div>
+						</div>
+
                         <div class="table-shell desktop-visible" style="margin-top: 10px;">
                             <div class="bg-white/65 px-5 py-3 text-xs font-bold uppercase tracking-[0.18em] text-[var(--muted)]">
                                 列表模式
@@ -5469,6 +5617,80 @@
                                             <span class="switch-slider"></span>
                                         </span>
                                     </label>
+									<div v-if="config.enable_billing" class="two-col-grid">
+										<div>
+											<label class="mb-2 block text-sm font-semibold text-[#6f7787]">本月费用告警阈值</label>
+											<input v-model.number="config.billing_cost_threshold" type="number" min="0" step="0.01" class="glass-input" placeholder="0 表示关闭">
+										</div>
+										<div>
+											<label class="mb-2 block text-sm font-semibold text-[#6f7787]">账户余额告警阈值</label>
+											<input v-model.number="config.billing_balance_threshold" type="number" min="0" step="0.01" class="glass-input" placeholder="0 表示关闭">
+										</div>
+										<p class="text-xs leading-5 text-[var(--muted)]" style="grid-column: 1 / -1;">阈值按各账号返回的币种判断；达到阈值只发送通知，不会自动停机。填写 0 可关闭对应告警。</p>
+									</div>
+                                </div>
+                            </div>
+
+                            <div v-if="currentSettingsTab === 'runtime'" class="metric-card runtime-center">
+                                <div class="runtime-center__head">
+                                    <div>
+                                        <p class="subtle-label">运行状态</p>
+                                        <h3 class="mt-1 text-lg font-bold">后台任务时间轴</h3>
+                                        <p class="mt-1 text-xs leading-5 text-[var(--muted)]">查看监控、同步、轮转、通知和任务队列的最近执行结果。</p>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <div class="runtime-center__summary" :data-state="runtimeStatus.overall">
+                                            <span class="runtime-center__summary-dot"></span>
+                                            <span>{{ runtimeOverallText }}</span>
+                                        </div>
+                                        <button type="button" class="ghost-button" :disabled="runtimeLoading" @click="fetchRuntimeStatus">
+                                            {{ runtimeLoading ? '刷新中' : '刷新' }}
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div v-if="runtimeStatus.components.length" class="runtime-timeline">
+                                    <article
+                                        v-for="component in runtimeStatus.components"
+                                        :key="component.key"
+                                        class="runtime-task"
+                                        :data-tone="runtimeStatusMeta(component.status).tone"
+                                    >
+                                        <span class="runtime-task__marker" aria-hidden="true"></span>
+                                        <div>
+                                            <div class="runtime-task__name">{{ component.label }}</div>
+                                            <span class="runtime-task__state">{{ runtimeStatusMeta(component.status).label }}</span>
+                                        </div>
+                                        <div class="runtime-task__detail">
+                                            <div>{{ component.detail || '尚无执行记录' }}</div>
+                                            <div v-if="component.last_error" class="runtime-task__error" :title="component.last_error">{{ component.last_error }}</div>
+                                        </div>
+                                        <div class="runtime-task__times">
+                                            <span>最近成功 <strong>{{ runtimeFormatDateTime(component.last_success_at) }}</strong></span>
+                                            <span>执行耗时 <strong>{{ runtimeFormatDuration(component.last_duration_ms) }}</strong></span>
+                                            <span>最近启动 <strong>{{ runtimeFormatDateTime(component.last_started_at) }}</strong></span>
+                                            <span>下次执行 <strong>{{ runtimeFormatDateTime(component.next_run_at) }}</strong></span>
+                                        </div>
+                                    </article>
+                                </div>
+                                <div v-else class="py-8 text-center text-sm text-[var(--muted)]">
+                                    {{ runtimeLoading ? '正在读取运行状态…' : '后台任务尚未生成运行记录。' }}
+                                </div>
+
+                                <div class="runtime-jobs">
+                                    <span class="runtime-jobs__item">等待<strong>{{ runtimeStatus.job_counts.queued || 0 }}</strong></span>
+                                    <span class="runtime-jobs__item">执行中<strong>{{ runtimeStatus.job_counts.running || 0 }}</strong></span>
+                                    <span class="runtime-jobs__item">重试<strong>{{ runtimeStatus.job_counts.retry || 0 }}</strong></span>
+                                    <span class="runtime-jobs__item">失败<strong>{{ runtimeStatus.job_counts.failed || 0 }}</strong></span>
+                                </div>
+                                <div v-if="runtimeStatus.failed_jobs.length" class="runtime-failed-jobs">
+                                    <div v-for="job in runtimeStatus.failed_jobs" :key="job.job_id" class="runtime-failed-job">
+                                        <div class="runtime-failed-job__name">{{ runtimeJobLabel(job.kind) }} · {{ job.entity_key }}</div>
+                                        <div class="runtime-failed-job__error" :title="job.last_error">{{ job.last_error || '任务执行失败' }}</div>
+                                        <button type="button" class="ghost-button" :disabled="retryingRuntimeJob === job.job_id" @click="retryRuntimeJob(job)">
+                                            {{ retryingRuntimeJob === job.job_id ? '入队中' : '重新执行' }}
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
 
@@ -5600,12 +5822,19 @@
                             <div class="tab-pill-group">
                                 <button @click="currentLogTab = 'action'; fetchLogs()" class="ghost-button" :class="{ 'text-dark-button': currentLogTab === 'action' }">动作日志</button>
                                 <button @click="currentLogTab = 'heartbeat'; fetchLogs()" class="ghost-button" :class="{ 'text-dark-button': currentLogTab === 'heartbeat' }">心跳日志</button>
-                                <button @click="clearLogs" class="danger-button">清空</button>
+								<button @click="currentLogTab = 'audit'; fetchLogs()" class="ghost-button" :class="{ 'text-dark-button': currentLogTab === 'audit' }">操作审计</button>
+                                <button v-if="currentLogTab !== 'audit'" @click="clearLogs" class="danger-button">清空</button>
                             </div>
                         </div>
 
+						<div v-if="currentLogTab === 'audit'" class="audit-toolbar">
+							<app-select v-model="auditFilters.source" class="glass-select" :options="auditSourceOptions" @update:model-value="fetchLogs" />
+							<app-select v-model="auditFilters.action" class="glass-select" :options="auditActionOptions" @update:model-value="fetchLogs" />
+							<input v-model.trim="auditFilters.keyword" @input="scheduleAuditSearch" class="glass-input" placeholder="搜索请求编号、实体或摘要">
+						</div>
+
                         <div class="mt-5 space-y-3">
-                            <article v-for="log in systemLogs" :key="log.id || log.time_str + log.message" class="metric-card log-card">
+							<article v-if="currentLogTab !== 'audit'" v-for="log in systemLogs" :key="log.id || log.time_str + log.message" class="metric-card log-card">
                                 <div class="flex flex-wrap items-center justify-between gap-2">
                                     <div class="flex items-center gap-2">
                                         <span class="status-pill"
@@ -5619,6 +5848,23 @@
                                 </div>
                                 <p class="mt-3 font-mono text-sm leading-6">{{ log.message }}</p>
                             </article>
+
+							<article v-if="currentLogTab === 'audit'" v-for="log in systemLogs" :key="log.request_id" class="metric-card log-card">
+								<div class="flex flex-wrap items-center justify-between gap-2">
+									<div class="flex flex-wrap items-center gap-2">
+										<span class="status-pill" :class="log.success ? 'status-running' : 'status-stopped'">{{ log.success ? '成功' : '失败' }}</span>
+										<span class="status-pill status-transition">{{ auditSourceLabel(log.source) }}</span>
+										<strong class="text-sm">{{ auditActionLabel(log.action) }}</strong>
+									</div>
+									<span class="text-xs text-[var(--muted)] font-mono">{{ runtimeFormatDateTime(log.created_at) }}</span>
+								</div>
+								<p class="audit-card__summary">{{ log.summary }}</p>
+								<div class="audit-card__meta">
+									<span class="audit-card__request">请求 {{ log.request_id }}</span>
+									<span v-if="log.entity_id">{{ log.entity_type || '实体' }} · {{ log.entity_id }}</span>
+								</div>
+								<p v-if="log.error" class="audit-card__error">{{ log.error }}</p>
+							</article>
 
                             <div v-if="systemLogs.length === 0" class="metric-card">
                                 <p class="text-center text-sm text-[var(--muted)]">当前没有日志记录。</p>
@@ -6455,6 +6701,7 @@
     </div>
 
     <script src="static/vue.global.prod.js?v=__ASSET_VERSION__"></script>
+    <script src="static/runtime-status.js?v=__ASSET_VERSION__"></script>
     <script>
         // Keep legacy action URLs while attaching the Go backend's CSRF token.
         const nativeFetch = window.fetch.bind(window);
@@ -6873,6 +7120,8 @@
                     inventory_sync_enabled: true,
                     inventory_sync_interval: 3600,
                     enable_billing: false,
+					billing_cost_threshold: 0,
+					billing_balance_threshold: 0,
                     AppBrand: {
                         logo_url: ''
                     },
@@ -6955,6 +7204,45 @@
                 ));
                 const allInstances = ref([]);
                 const systemLogs = ref([]);
+				const billingAnalysis = ref({ enabled: false, cycle: '', summary: {}, accounts: [] });
+				const billingAnalysisLoading = ref(false);
+				const billingAnalysisError = ref('');
+				const auditFilters = ref({ source: '', action: '', keyword: '' });
+				const auditSourceOptions = [
+					{ value: '', label: '全部来源' },
+					{ value: 'web', label: '网页' },
+					{ value: 'telegram', label: 'Telegram' },
+					{ value: 'schedule', label: '定时任务' },
+					{ value: 'rotation', label: '轮转与 DDNS' },
+					{ value: 'traffic_protection', label: '流量保护' },
+					{ value: 'background_job', label: '后台任务' }
+				];
+				const auditActionOptions = [
+					{ value: '', label: '全部动作' },
+					{ value: 'instance_start', label: '实例开机' },
+					{ value: 'instance_stop', label: '实例停机' },
+					{ value: 'scheduled_start', label: '定时开机' },
+					{ value: 'scheduled_stop', label: '定时停机' },
+					{ value: 'traffic_threshold_stop', label: '流量阈值停机' },
+					{ value: 'ddns_update', label: 'DDNS 更新' },
+					{ value: 'ecs_create', label: '创建 ECS' },
+					{ value: 'instance_release', label: '释放实例' },
+					{ value: 'config_update', label: '配置修改' },
+					{ value: 'inventory_sync', label: '清单同步' }
+				];
+				let auditSearchTimer = null;
+                const runtimeStatus = ref({ overall: 'working', components: [], job_counts: {}, failed_jobs: [] });
+                const runtimeLoading = ref(false);
+                const retryingRuntimeJob = ref('');
+                const runtimeStatusUI = window.ECSRuntimeStatusUI;
+                const runtimeStatusMeta = (status) => runtimeStatusUI.metaFor(status);
+                const runtimeFormatDateTime = (value) => runtimeStatusUI.formatDateTime(value);
+                const runtimeFormatDuration = (value) => runtimeStatusUI.formatDuration(value);
+                const runtimeOverallText = computed(() => ({
+                    ok: '后台任务正常',
+                    error: '存在执行异常',
+                    working: '后台任务运行中'
+                }[runtimeStatus.value.overall] || '状态待确认'));
                 const initialized = ref(true);
 
                 const loadingCheckInit = ref(true);
@@ -6980,9 +7268,9 @@
                 };
                 const savedNavigation = readNavigationState();
                 const validMenus = ['manage', 'groups', 'accounts', 'settings', 'logs', 'about'];
-                const validSettingsTabs = ['instance', 'notifications', 'global'];
+                const validSettingsTabs = ['instance', 'runtime', 'notifications', 'global'];
                 const validNotifyTabs = ['telegram', 'email', 'webhook'];
-                const validLogTabs = ['action', 'heartbeat'];
+                const validLogTabs = ['action', 'heartbeat', 'audit'];
                 const currentMenu = ref(validMenus.includes(savedNavigation.menu) ? savedNavigation.menu : 'manage');
                 const mobileNavHidden = ref(false);
                 const currentSettingsTab = ref(validSettingsTabs.includes(savedNavigation.settingsTab) ? savedNavigation.settingsTab : 'instance');
@@ -7223,6 +7511,7 @@
                 let logInterval = null;
                 let manageInterval = null;
                 let accountInterval = null;
+                let runtimeInterval = null;
                 const liveRefreshInterval = 5000;
 
                 const getRegionName = (regionId) => {
@@ -7682,6 +7971,7 @@
 
                 const settingsItems = [
                     { key: 'instance', label: '实例配置', description: '阈值、同步与费用' },
+                    { key: 'runtime', label: '运行状态', description: '监控、轮转与任务' },
                     { key: 'notifications', label: '通知中心', description: '邮件、Telegram、回调' },
                     { key: 'global', label: '全局配置', description: '品牌、账号与安全' }
                 ];
@@ -7787,6 +8077,8 @@
                         inventory_sync_enabled: source.inventory_sync_enabled !== false,
                         inventory_sync_interval: Number(source.inventory_sync_interval || 3600),
                         enable_billing: !!source.enable_billing,
+						billing_cost_threshold: Number(source.billing_cost_threshold || 0),
+						billing_balance_threshold: Number(source.billing_balance_threshold || 0),
                         AppBrand: source.AppBrand || {},
                         Notification: source.Notification || {}
                     });
@@ -7813,6 +8105,35 @@
                         console.error('Fetch config failed', error);
                     }
                 };
+
+				const fetchBillingAnalysis = async (refresh = false) => {
+					if (!isAdmin.value || billingAnalysisLoading.value) return;
+					billingAnalysisLoading.value = true;
+					billingAnalysisError.value = '';
+					try {
+						const res = await fetch(`index.php?action=get_billing_analysis${refresh ? '&refresh=1' : ''}`, { cache: 'no-store' });
+						const data = await res.json();
+						if (!res.ok || data.error) throw new Error(data.error || '费用分析请求失败');
+						billingAnalysis.value = {
+							enabled: data.enabled === true,
+							cycle: data.cycle || '',
+							summary: data.summary || {},
+							accounts: Array.isArray(data.accounts) ? data.accounts : []
+						};
+					} catch (error) {
+						billingAnalysisError.value = error.message || '费用分析请求失败';
+					} finally {
+						billingAnalysisLoading.value = false;
+					}
+				};
+
+				const formatAvailableDays = (value) => {
+					const days = Number(value);
+					if (!Number.isFinite(days)) return '-';
+					if (days >= 3650) return '10 年以上';
+					if (days >= 365) return `${(days / 365).toFixed(1)} 年`;
+					return `${Math.max(0, days).toFixed(days < 10 ? 1 : 0)} 天`;
+				};
 
                 const stopUpdatePolling = () => {
                     if (updateInterval) {
@@ -8175,12 +8496,112 @@
                 const fetchLogs = async () => {
                     if (!isAdmin.value) return;
                     try {
-                        const res = await fetch(`index.php?action=get_logs&tab=${currentLogTab.value}`);
+						const params = new URLSearchParams();
+						if (currentLogTab.value === 'audit') {
+							params.set('action', 'get_audit_logs');
+							if (auditFilters.value.source) params.set('source', auditFilters.value.source);
+							if (auditFilters.value.action) params.set('audit_action', auditFilters.value.action);
+							if (auditFilters.value.keyword) params.set('keyword', auditFilters.value.keyword);
+						} else {
+							params.set('action', 'get_logs');
+							params.set('tab', currentLogTab.value);
+						}
+						const res = await fetch(`index.php?${params.toString()}`);
                         const data = await res.json();
                         systemLogs.value = data.data || [];
                     } catch (error) {
                         console.error('Fetch logs failed', error);
                     }
+                };
+
+				const scheduleAuditSearch = () => {
+					if (auditSearchTimer) clearTimeout(auditSearchTimer);
+					auditSearchTimer = setTimeout(fetchLogs, 250);
+				};
+
+				const auditSourceLabel = (source) => ({
+					web: '网页', telegram: 'Telegram', schedule: '定时任务', rotation: '轮转与 DDNS',
+					traffic_protection: '流量保护', background_job: '后台任务'
+				}[source] || source || '未知来源');
+
+				const auditActionLabel = (action) => ({
+					instance_start: '实例开机', instance_stop: '实例停机', instance_refresh: '同步实例',
+					instance_settings_update: '修改实例设置', instance_release_submit: '提交实例释放',
+					instance_release: '释放实例', instance_ip_replace: '更换公网 IP',
+					scheduled_start: '定时开机', scheduled_stop: '定时停机',
+					rotation_advance_start: '分组提前开机', rotation_delayed_stop: '分组延后关机',
+					traffic_threshold_stop: '流量阈值停机', ddns_update: 'DDNS 更新',
+					ecs_create_submit: '提交 ECS 创建', ecs_create: '创建 ECS', config_update: '配置修改',
+					account_sync: '同步账号', inventory_sync: '同步清单', online_update_submit: '提交在线更新',
+					job_retry: '重试后台任务', logs_clear: '清空日志', traffic_block_restore: '恢复定时任务'
+				}[action] || action || '未知动作');
+
+                const fetchRuntimeStatus = async () => {
+                    if (!isAdmin.value || runtimeLoading.value) return;
+                    runtimeLoading.value = true;
+                    try {
+                        const res = await fetch('index.php?action=get_runtime_status', { cache: 'no-store' });
+                        const data = await res.json();
+                        if (!res.ok || data.error) {
+                            throw new Error(data.error || '运行状态请求失败');
+                        }
+                        runtimeStatus.value = {
+                            overall: data.overall || 'working',
+                            components: Array.isArray(data.components) ? data.components : [],
+                            job_counts: data.job_counts || {},
+                            failed_jobs: Array.isArray(data.failed_jobs) ? data.failed_jobs : []
+                        };
+                    } catch (error) {
+                        console.error('Fetch runtime status failed', error);
+                        runtimeStatus.value = {
+                            ...runtimeStatus.value,
+                            overall: 'error'
+                        };
+                    } finally {
+                        runtimeLoading.value = false;
+                    }
+                };
+
+                const stopRuntimePolling = () => {
+                    if (runtimeInterval) {
+                        clearInterval(runtimeInterval);
+                        runtimeInterval = null;
+                    }
+                };
+
+                const runtimeJobLabel = (kind) => ({
+                    create_ecs: '创建 ECS',
+                    delete_instance: '释放实例'
+                }[kind] || kind || '后台任务');
+
+                const retryRuntimeJob = async (job) => {
+                    if (!job?.job_id || retryingRuntimeJob.value) return;
+                    retryingRuntimeJob.value = job.job_id;
+                    try {
+                        const res = await fetch('index.php?action=retry_runtime_job', {
+                            method: 'POST',
+                            body: JSON.stringify({ jobId: job.job_id })
+                        });
+                        const data = await res.json();
+                        if (!res.ok || data.error) {
+                            throw new Error(data.error || '任务重新入队失败');
+                        }
+                        openAlert('失败任务已重新进入后台队列', 'success');
+                        await fetchRuntimeStatus();
+                    } catch (error) {
+                        openAlert(error.message || '任务重新入队失败', 'error');
+                    } finally {
+                        retryingRuntimeJob.value = '';
+                    }
+                };
+
+                const startRuntimePolling = () => {
+                    stopRuntimePolling();
+                    if (!initialized.value || criticalError.value || currentMenu.value !== 'settings' || currentSettingsTab.value !== 'runtime' || !isAdmin.value) {
+                        return;
+                    }
+                    fetchRuntimeStatus();
+                    runtimeInterval = setInterval(fetchRuntimeStatus, 5000);
                 };
 
                 const clearLogs = async () => {
@@ -8295,6 +8716,9 @@
                             markConfigClean();
                             if (isAdmin.value) {
                                 await fetchAllInstances(false);
+								if (currentMenu.value === 'accounts' && config.value.enable_billing) {
+									await fetchBillingAnalysis(true);
+								}
                             }
                             if (successMessage) {
                                 openAlert(successMessage, 'success');
@@ -9642,7 +10066,10 @@
                     }
 
                     if (menu === 'accounts' && isAdmin.value) {
-                        await fetchConfig();
+						await fetchConfig();
+						if (config.value.enable_billing) {
+							await fetchBillingAnalysis(false);
+						}
                         startAccountPolling();
                     } else {
                         stopAccountPolling();
@@ -9663,9 +10090,16 @@
                     } else if (!updatePending) {
                         stopUpdatePolling();
                     }
+
+                    if (menu === 'settings' && currentSettingsTab.value === 'runtime' && isAdmin.value) {
+                        startRuntimePolling();
+                    } else {
+                        stopRuntimePolling();
+                    }
                 };
 
                 watch(currentMenu, syncCurrentMenu);
+                watch(currentSettingsTab, () => startRuntimePolling());
                 watch([currentMenu, currentSettingsTab, currentNotifyTab, currentLogTab], persistNavigationState);
 
                 watch(isAdmin, async (value) => {
@@ -9683,6 +10117,7 @@
                         initialWorkspaceLoading.value = false;
                         stopManagePolling();
                         stopAccountPolling();
+                        stopRuntimePolling();
                     }
                 });
 
@@ -9791,6 +10226,7 @@
                     stopLogPolling();
                     stopManagePolling();
                     stopAccountPolling();
+                    stopRuntimePolling();
                     stopUpdatePolling();
                     stopUpdateSimulation();
                     if (updateReloadTimer) {
@@ -9803,12 +10239,29 @@
                     if (imageTimer) {
                         clearTimeout(imageTimer);
                     }
+					if (auditSearchTimer) {
+						clearTimeout(auditSearchTimer);
+					}
                 });
 
                 return {
                     aliyunRegions,
                     allInstances,
                     config,
+					billingAnalysis,
+					billingAnalysisLoading,
+					billingAnalysisError,
+					fetchBillingAnalysis,
+					formatAvailableDays,
+                    runtimeStatus,
+                    runtimeLoading,
+                    retryingRuntimeJob,
+                    runtimeOverallText,
+                    runtimeStatusMeta,
+                    runtimeFormatDateTime,
+                    runtimeFormatDuration,
+                    runtimeJobLabel,
+                    retryRuntimeJob,
                     updateInfo,
                     updateState,
                     updateReloadPending,
@@ -9900,6 +10353,12 @@
                     showInstanceScheduleModal,
                     showLoginModal,
                     systemLogs,
+					auditFilters,
+					auditSourceOptions,
+					auditActionOptions,
+					auditSourceLabel,
+					auditActionLabel,
+					scheduleAuditSearch,
                     testingTelegram,
                     testingWebhook,
                     uploadingLogo,
@@ -9981,6 +10440,7 @@
                     sendTestTelegram,
                     sendTestWebhook,
                     fetchLogs,
+                    fetchRuntimeStatus,
                     clearLogs,
                     checkForUpdates,
                     handleUpdateAction,

@@ -25,6 +25,18 @@ func main() {
 		fmt.Printf("version=%s\ncommit=%s\nbuild_date=%s\n", app.Version, app.Commit, app.BuildDate)
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "--verify-release" {
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "用法: ecs-controller --verify-release checksums.txt checksums.txt.sig")
+			os.Exit(2)
+		}
+		if err := app.VerifyReleaseSignature(os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("release_signature=valid")
+		return
+	}
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	dataDir := env("ECS_DATA_DIR", "/var/lib/ecs-controller")
 	if err := os.MkdirAll(dataDir, 0700); err != nil {

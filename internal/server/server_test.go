@@ -91,7 +91,7 @@ func TestTemplateAndStaticAssetsUseCompressionAndCacheHeaders(t *testing.T) {
 	}
 }
 
-func TestReleaseHasAssetsRequiresPackageAndChecksum(t *testing.T) {
+func TestReleaseHasAssetsRequiresPackageChecksumAndSignature(t *testing.T) {
 	var release githubRelease
 	release.Assets = append(release.Assets, struct {
 		Name string `json:"name"`
@@ -102,8 +102,14 @@ func TestReleaseHasAssetsRequiresPackageAndChecksum(t *testing.T) {
 	release.Assets = append(release.Assets, struct {
 		Name string `json:"name"`
 	}{Name: "checksums.txt"})
+	if releaseHasAssets(release, "ecs-controller-linux-amd64.tar.gz") {
+		t.Fatal("release without checksums.txt.sig must not be installable")
+	}
+	release.Assets = append(release.Assets, struct {
+		Name string `json:"name"`
+	}{Name: "checksums.txt.sig"})
 	if !releaseHasAssets(release, "ecs-controller-linux-amd64.tar.gz") {
-		t.Fatal("release package and checksums.txt should be installable")
+		t.Fatal("release package, checksum and signature should be installable")
 	}
 }
 
@@ -121,6 +127,7 @@ func TestCheckForUpdateUsesGitHubReleaseTagsAsDisplayVersions(t *testing.T) {
 				"assets": []map[string]any{
 					{"name": "ecs-controller-linux-amd64.tar.gz"},
 					{"name": "checksums.txt"},
+					{"name": "checksums.txt.sig"},
 				},
 			})
 		case "/repos/elunez/ecs-controller/commits/v1.6.40":
@@ -1037,12 +1044,68 @@ type fakeSyncClient struct {
 	publicNetworkErr error
 }
 
+type blockingSyncClient struct {
+	*fakeSyncClient
+	key     string
+	entered chan<- string
+	release <-chan struct{}
+}
+
+func (f *blockingSyncClient) DescribeInstances(ctx context.Context, _ string) ([]cloud.Instance, error) {
+	f.entered <- f.key
+	select {
+	case <-f.release:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (f *fakeSyncClient) DescribeInstances(context.Context, string) ([]cloud.Instance, error) {
 	return f.instances, f.describeErr
 }
 
 func (f *fakeSyncClient) DescribeInstancePublicNetworks(context.Context, string, []string) (map[string]cloud.InstancePublicNetwork, error) {
 	return f.publicNetworks, f.publicNetworkErr
+}
+
+func TestSyncInventoryRunsAccountGroupsConcurrently(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	groups := []app.AccountGroup{
+		{GroupKey: "group-a", AccessKeyID: "ak-a", AccessKeySecret: "sk", RegionID: "cn-a"},
+		{GroupKey: "group-b", AccessKeyID: "ak-b", AccessKeySecret: "sk", RegionID: "cn-b"},
+	}
+	if err := st.SaveGroups(groups); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	srv := New(st, t.TempDir(), "")
+	srv.CloudFactory = func(account app.Account) cloud.Client {
+		return &blockingSyncClient{fakeSyncClient: &fakeSyncClient{}, key: account.AccessKeyID, entered: entered, release: release}
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, syncErr := srv.SyncInventory(context.Background())
+		done <- syncErr
+	}()
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case key := <-entered:
+			seen[key] = true
+		case <-time.After(time.Second):
+			t.Fatalf("inventory groups did not run concurrently: %#v", seen)
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 }
 
 type fakeBillingDetailsClient struct {

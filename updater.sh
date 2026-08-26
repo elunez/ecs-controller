@@ -23,6 +23,26 @@ update_request_id=
 mkdir -p "$update_dir" "$releases_dir"
 rmdir "$lock_dir" 2>/dev/null || true
 
+cleanup_failed_downloads() {
+    for candidate in "$update_dir"/.download.*; do
+        [ -d "$candidate" ] || continue
+        rm -rf "$candidate"
+    done
+}
+
+cleanup_releases() {
+    keep_current=$1
+    keep_rollback=${2:-}
+    for candidate in "$releases_dir"/* "$releases_dir"/.replaced-*; do
+        [ -d "$candidate" ] || continue
+        [ "$candidate" = "$keep_current" ] && continue
+        [ -n "$keep_rollback" ] && [ "$candidate" = "$keep_rollback" ] && continue
+        rm -rf "$candidate"
+    done
+}
+
+cleanup_failed_downloads
+
 json_escape() {
     printf '%s' "$1" | awk 'BEGIN { ORS="" } { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\r/, ""); printf "%s", $0 }'
 }
@@ -127,12 +147,20 @@ run_update() {
     }
     archive=$work_dir/$asset
     checksums=$work_dir/checksums.txt
+    signature=$work_dir/checksums.txt.sig
     extracted=$work_dir/release
 
     write_status running downloading "正在下载 GitHub Release" 25 "$target" "$previous_commit" "$version"
     if ! curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "$archive" "$base_url/$asset" || \
-       ! curl -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$checksums" "$base_url/checksums.txt"; then
+       ! curl -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$checksums" "$base_url/checksums.txt" || \
+       ! curl -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$signature" "$base_url/checksums.txt.sig"; then
         write_status error failed "GitHub Release 下载失败，请检查网络后重试" 0 "$target" "$previous_commit" "$version"
+        rm -rf "$work_dir"
+        return
+    fi
+
+    if ! ECS_APP_DIR="$current_link" "$current_link/ecs-controller" --verify-release "$checksums" "$signature" >/dev/null 2>&1; then
+        write_status error failed "更新清单 Ed25519 签名校验失败，已停止更新" 0 "$target" "$previous_commit" "$version"
         rm -rf "$work_dir"
         return
     fi
@@ -181,6 +209,8 @@ run_update() {
         install -m 0755 "$release_dir/updater.sh" "$install_root/updater.sh"
         write_status success completed "更新完成，当前已运行最新版本" 100 "$target" "$target" "$version"
         rm -rf "$work_dir"
+        cleanup_releases "$release_dir" "$previous_release"
+        cleanup_failed_downloads
         return
     fi
 
@@ -192,6 +222,12 @@ run_update() {
     fi
     write_status error rolled_back "新版本健康检查失败，已恢复更新前版本" 0 "$target" "$previous_commit" "$version"
     rm -rf "$work_dir"
+    if [ -n "$previous_release" ]; then
+        cleanup_releases "$previous_release"
+    else
+        cleanup_releases "$release_dir"
+    fi
+    cleanup_failed_downloads
 }
 
 while :; do

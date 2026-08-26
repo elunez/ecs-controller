@@ -45,6 +45,23 @@ type fakeDailyCloud struct {
 	dailyEndMS   int64
 }
 
+type blockingMonitorCloud struct {
+	*fakeCloud
+	key     string
+	entered chan<- string
+	release <-chan struct{}
+}
+
+func (f *blockingMonitorCloud) DescribeInstance(ctx context.Context, _, _ string) (*cloud.Instance, error) {
+	f.entered <- f.key
+	select {
+	case <-f.release:
+		return &cloud.Instance{Status: "Running", PublicIP: "203.0.113.10"}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (f *fakeDailyCloud) GetInstanceDailyTraffic(_ context.Context, _ string, _ string, _ string, startMS, endMS int64) (float64, int, error) {
 	f.dailyStartMS = startMS
 	f.dailyEndMS = endMS
@@ -118,6 +135,52 @@ func (f *fakeCloud) GetOutboundTrafficDelta(context.Context, string, string, str
 }
 func (f *fakeCloud) GetBilling(context.Context, string, string, string) (float64, float64, string, error) {
 	return 0, 0, "CNY", nil
+}
+
+func TestMonitorCycleRunsDifferentAccountGroupsConcurrently(t *testing.T) {
+	s, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for id, group := range []string{"group-a", "group-b"} {
+		if err := s.UpsertAccount(app.Account{ID: int64(id + 1), AccessKeyID: group, AccessKeySecret: "sk", GroupKey: group, RegionID: "cn-test", InstanceID: "i-" + group, InstanceStatus: "Running", MaxTraffic: 200}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	clients := map[string]cloud.Client{}
+	for _, group := range []string{"group-a", "group-b"} {
+		clients[group] = &blockingMonitorCloud{fakeCloud: &fakeCloud{outboundPoints: 1, outboundLastMS: time.Now().UnixMilli()}, key: group, entered: entered, release: release}
+	}
+	w := &Worker{Store: s, CloudFactory: func(group app.AccountGroup) cloud.Client { return clients[group.AccessKeyID] }}
+	done := make(chan struct{})
+	go func() {
+		w.runMonitorCycle(context.Background(), time.Minute)
+		close(done)
+	}()
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case key := <-entered:
+			seen[key] = true
+		case <-time.After(time.Second):
+			t.Fatalf("account groups did not run concurrently: %#v", seen)
+		}
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitor cycle did not finish")
+	}
+	status, err := s.RuntimeStatus(runtimeInstanceMonitor)
+	if err != nil || status.Status != "ok" {
+		t.Fatalf("runtime status=%#v err=%v", status, err)
+	}
 }
 func (f *fakeCloud) GetBillOverview(context.Context, string, string) (float64, string, error) {
 	f.billingCostCalls++

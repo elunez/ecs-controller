@@ -61,6 +61,51 @@ func TestSecretsAndAccountsAreEncrypted(t *testing.T) {
 	}
 }
 
+func TestRuntimeStatusRoundTripAndJobCounts(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	want := app.RuntimeStatus{Key: "instance_monitor", Label: "实例监控", Status: "ok", LastStartedAt: 10, LastSuccessAt: 11, LastDurationMS: 250, NextRunAt: 70, Detail: "2 台实例"}
+	if err := s.SetRuntimeStatus(want, 10); err != nil {
+		t.Fatal(err)
+	}
+	items, err := s.RuntimeStatuses()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("runtime statuses=%#v err=%v", items, err)
+	}
+	if got := items[0]; got.Key != want.Key || got.Status != want.Status || got.Detail != want.Detail || got.LastDurationMS != want.LastDurationMS {
+		t.Fatalf("runtime status=%#v", got)
+	}
+	if err := s.EnqueueJob("job-runtime", "create_ecs", "task-1", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := s.JobStatusCounts()
+	if err != nil || counts["queued"] != 1 {
+		t.Fatalf("job counts=%#v err=%v", counts, err)
+	}
+	job, err := s.ClaimJob(time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("claim job=%#v err=%v", job, err)
+	}
+	if err := s.FailJob(job.JobID, "temporary failure"); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := s.FailedJobs(5)
+	if err != nil || len(failed) != 1 || failed[0]["job_id"] != job.JobID {
+		t.Fatalf("failed jobs=%#v err=%v", failed, err)
+	}
+	if requeued, err := s.RequeueFailedJob(job.JobID); err != nil || !requeued {
+		t.Fatalf("requeued=%v err=%v", requeued, err)
+	}
+	counts, err = s.JobStatusCounts()
+	if err != nil || counts["retry"] != 1 || counts["failed"] != 0 {
+		t.Fatalf("requeued job counts=%#v err=%v", counts, err)
+	}
+}
+
 func TestSaveGroupsRejectsDuplicateAccountRegion(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {
@@ -510,6 +555,28 @@ func TestFailedTaskWithCreatedInstanceAllowsOneTimeCredentialRecovery(t *testing
 	second, err := s.ConsumeInstanceTaskPassword("i-created")
 	if err == nil || second != nil {
 		t.Fatalf("credential was not one-time: task=%#v err=%v", second, err)
+	}
+}
+
+func TestAuditLogsFilterAndRedactSecrets(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.AddAudit(app.AuditEntry{RequestID: "web-1", Source: app.AuditSourceWeb, Action: "config_update", EntityType: "configuration", EntityID: "global", Summary: "保存配置 password=plain-secret", Success: false, Error: "token: hidden-token"}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := s.AuditLogs(app.AuditSourceWeb, "config_update", "global", 20)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("audit logs=%#v err=%v", items, err)
+	}
+	combined := items[0].Summary + " " + items[0].Error
+	if strings.Contains(combined, "plain-secret") || strings.Contains(combined, "hidden-token") {
+		t.Fatalf("audit leaked secret: %q", combined)
+	}
+	if !strings.Contains(combined, "[已隐藏]") {
+		t.Fatalf("audit did not mark redaction: %q", combined)
 	}
 }
 

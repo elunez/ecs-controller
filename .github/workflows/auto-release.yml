@@ -64,8 +64,13 @@ jobs:
         shell: bash
         env:
           BIN_DIR: ${{ runner.temp }}/ecs-controller-binaries
+          ECS_RELEASE_SIGNING_KEY: ${{ secrets.ECS_RELEASE_SIGNING_KEY }}
         run: |
           set -Eeuo pipefail
+          if [[ -z "$ECS_RELEASE_SIGNING_KEY" ]]; then
+            echo "缺少 ECS_RELEASE_SIGNING_KEY，拒绝发布未签名版本。" >&2
+            exit 1
+          fi
           release_dir="$RUNNER_TEMP/ecs-controller-release"
           mkdir -p "$release_dir"
 
@@ -96,6 +101,14 @@ jobs:
           package_windows amd64
           package_windows arm64
           (cd "$release_dir" && sha256sum ecs-controller-* > checksums.txt)
+          signing_key="$RUNNER_TEMP/ecs-controller-release-signing.pem"
+          derived_public_key="$RUNNER_TEMP/ecs-controller-release-public.pem"
+          printf '%s\n' "$ECS_RELEASE_SIGNING_KEY" >"$signing_key"
+          chmod 0600 "$signing_key"
+          openssl pkey -in "$signing_key" -pubout -out "$derived_public_key"
+          diff -u internal/app/release-public-key.pem "$derived_public_key"
+          openssl pkeyutl -sign -rawin -inkey "$signing_key" -in "$release_dir/checksums.txt" -out "$release_dir/checksums.txt.sig"
+          rm -f "$signing_key"
           ls -lh "$release_dir"
 
       - name: Generate release notes

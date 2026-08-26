@@ -107,16 +107,18 @@ func releaseHasAssets(release githubRelease, assetName string) bool {
 	if assetName == "" {
 		return false
 	}
-	foundPackage, foundChecksums := false, false
+	foundPackage, foundChecksums, foundSignature := false, false, false
 	for _, asset := range release.Assets {
 		switch asset.Name {
 		case assetName:
 			foundPackage = true
 		case "checksums.txt":
 			foundChecksums = true
+		case "checksums.txt.sig":
+			foundSignature = true
 		}
 	}
-	return foundPackage && foundChecksums
+	return foundPackage && foundChecksums && foundSignature
 }
 
 func (s *Server) releasePackageAvailable(release githubRelease, assetName string) bool {

@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kori1c/ecs-controller/internal/app"
@@ -29,56 +30,6 @@ func (w *Worker) cloudClient(group app.AccountGroup) cloud.Client {
 	return w.CloudFactory(group)
 }
 
-// InventoryMonitor periodically reconciles the complete ECS list for every
-// configured account group. It runs independently from the per-instance
-// status/traffic monitor so a slow list operation cannot delay automation.
-func (w *Worker) InventoryMonitor(ctx context.Context, checkInterval time.Duration) {
-	if checkInterval < 30*time.Second {
-		checkInterval = 30 * time.Second
-	}
-	w.runInventorySync(ctx, time.Now())
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-ticker.C:
-			w.runInventorySync(ctx, now)
-		}
-	}
-}
-
-func (w *Worker) runInventorySync(ctx context.Context, now time.Time) bool {
-	if w.InventorySync == nil || w.Store.GetSetting("inventory_sync_enabled", "1") != "1" {
-		return false
-	}
-	intervalSeconds, _ := strconv.ParseInt(w.Store.GetSetting("inventory_sync_interval", "3600"), 10, 64)
-	if intervalSeconds < 1800 || intervalSeconds > 86400 {
-		intervalSeconds = 3600
-	}
-	lastAttempt, _ := strconv.ParseInt(w.Store.GetSetting("inventory_sync_last_attempt", "0"), 10, 64)
-	if lastAttempt > 0 && now.Unix()-lastAttempt < intervalSeconds {
-		return false
-	}
-	_ = w.Store.SetSetting("inventory_sync_last_attempt", strconv.FormatInt(now.Unix(), 10))
-	count, err := w.InventorySync(ctx)
-	if err != nil {
-		failures, _ := strconv.Atoi(w.Store.GetSetting("inventory_sync_failures", "0"))
-		failures++
-		_ = w.Store.SetSetting("inventory_sync_failures", strconv.Itoa(failures))
-		w.Store.AddLog("warning", "账号实例清单自动同步失败: "+err.Error())
-		if failures == 3 {
-			w.dispatchEvent(ctx, notify.Event{Title: "账号实例清单同步失败", Summary: "已连续 3 次同步失败，请检查阿里云凭据和网络。", Text: "【ECS 控制台】账号实例清单自动同步已连续 3 次失败\n错误: " + err.Error(), Fields: map[string]string{"error": err.Error()}})
-		}
-		return true
-	}
-	_ = w.Store.SetSetting("inventory_sync_failures", "0")
-	_ = w.Store.SetSetting("inventory_sync_last_success", strconv.FormatInt(now.Unix(), 10))
-	w.Store.AddLog("info", fmt.Sprintf("账号实例清单自动同步完成：共发现 %d 台实例。", count))
-	return true
-}
-
 func cmsTrafficErrorMessage(err error) string {
 	if cloud.IsMetricNoDataError(err) {
 		return "云端数据尚未更新，请稍后再试"
@@ -91,161 +42,221 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 		interval = 30 * time.Second
 	}
 	w.Store.SetLastRun()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	w.setRuntimeWaiting(runtimeInstanceMonitor, "后台监控已启动", time.Now())
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			w.Store.SetLastRun()
-			now := time.Now()
-			if err := w.Store.ResetMonthlyTraffic(); err != nil {
-				w.Store.AddLog("warning", "月度流量状态重置失败: "+err.Error())
-			}
-			maintenanceDay := now.Format("2006-01-02")
-			if w.Store.GetSetting("maintenance_day", "") != maintenanceDay {
-				if err := w.Store.PruneMaintenance(now); err != nil {
-					w.Store.AddLog("warning", "数据库历史清理失败: "+err.Error())
-				}
-				if now.Hour() == 4 {
-					if err := w.Store.Vacuum(); err != nil {
-						w.Store.AddLog("warning", "数据库 VACUUM 失败: "+err.Error())
-					}
-				}
-				_ = w.Store.SetSetting("maintenance_day", maintenanceDay)
-			}
-			accounts, err := w.Store.LoadAccounts(false)
-			if err != nil {
-				w.Store.AddLog("error", "读取监控账号失败: "+err.Error())
-				continue
-			}
-			w.Store.AddLog("heartbeat", fmt.Sprintf("监控心跳正常：已检查 %d 个监控账号。", len(accounts)))
-			threshold, _ := strconv.ParseFloat(w.Store.GetSetting("traffic_threshold", "95"), 64)
-			if threshold <= 0 || threshold > 100 {
-				threshold = 95
-			}
-			thresholdAction := w.Store.GetSetting("threshold_action", "stop_and_notify")
-			shutdownMode := w.Store.GetSetting("shutdown_mode", "KeepCharging")
-			keepAlive := w.Store.GetSetting("keep_alive", "0") == "1"
-			monthlyAutoStart := w.Store.GetSetting("monthly_auto_start", "0") == "1"
-			enableBilling := w.Store.GetSetting("enable_billing", "0") == "1"
-			apiInterval, _ := strconv.ParseInt(w.Store.GetSetting("api_interval", "600"), 10, 64)
-			if apiInterval < 30 {
-				apiInterval = 600
-			}
-			for _, account := range accounts {
-				if account.InstanceID == "" {
-					continue
-				}
-				client := w.cloudClient(app.AccountGroup{AccessKeyID: account.AccessKeyID, AccessKeySecret: account.AccessKeySecret, RegionID: account.RegionID, SiteType: account.SiteType})
-				if client == nil {
-					continue
-				}
-				transient := account.InstanceStatus == "Starting" || account.InstanceStatus == "Stopping" || account.InstanceStatus == "Pending" || account.InstanceStatus == "Unknown"
-				shouldRefresh := account.UpdatedAt <= 0 || now.Unix()-account.UpdatedAt >= apiInterval || transient || now.Minute() == 0
-				if !shouldRefresh {
-					w.runCachedAutomation(ctx, client, &account, now, threshold, thresholdAction, shutdownMode, keepAlive, monthlyAutoStart)
-					continue
-				}
-				oldPublicIP := account.PublicIP
-				oldStatus := account.InstanceStatus
-				instance, describeErr := client.DescribeInstance(ctx, account.RegionID, account.InstanceID)
-				if describeErr != nil {
-					if removed, cleanupErr := w.queueMissingInstanceCleanup(account, describeErr); cleanupErr != nil {
-						w.Store.AddLog("warning", "清理云端不存在的实例记录失败: "+cleanupErr.Error())
-					} else if removed {
-						continue
-					}
-					metadata := map[string]any{"health_status": "error", "traffic_api_status": "unknown", "traffic_api_message": describeErr.Error()}
-					if cloud.IsCredentialError(describeErr) {
-						metadata["protection_suspended"] = true
-						metadata["protection_suspend_reason"] = "credential_invalid"
-						if account.ProtectionNotifiedAt == 0 {
-							w.dispatchEvent(ctx, notify.Event{Title: "阿里云凭据异常", Summary: "已暂停自动停机保护", AccountID: accountLabel(account), Text: fmt.Sprintf("【ECS 控制台】阿里云凭据异常\n账号/实例: %s\n实例 ID: %s\n区域: %s\n错误: %s\n系统已暂停自动停机保护，请更新 AK 后恢复。", accountLabel(account), account.InstanceID, account.RegionID, describeErr.Error()), Fields: map[string]string{"instance_id": account.InstanceID, "reason": "credential_invalid"}})
-							account.ProtectionNotifiedAt = now.Unix()
-							metadata["protection_suspend_notified_at"] = account.ProtectionNotifiedAt
-						}
-					}
-					_ = w.Store.UpdateAccountStatus(account.ID, account.TrafficUsed, account.InstanceStatus, now.Unix(), metadata)
-					continue
-				}
-				account.InstanceStatus, account.PublicIP, account.PrivateIP, account.InstanceType = instance.Status, instance.PublicIP, instance.PrivateIP, instance.InstanceType
-				if account.PublicIPMode == "eip" && account.EIPAddress != "" {
-					account.PublicIP = account.EIPAddress
-				}
-				account.HealthStatus, account.UpdatedAt = "ok", now.Unix()
-				if oldStatus != "" && oldStatus != account.InstanceStatus {
-					w.dispatchEvent(ctx, statusEvent(account, oldStatus, account.InstanceStatus, "系统监控检测到实例状态变化。"))
-				}
-				traffic, trafficStatus, trafficMessage, trafficErr := w.refreshTraffic(ctx, client, account, now)
-				if trafficErr != nil {
-					reason := "traffic_api_error"
-					if cloud.IsCredentialError(trafficErr) {
-						reason = "credential_invalid"
-					}
-					account.TrafficAPIStatus, account.TrafficAPIMessage = "error", trafficMessage
-					account.ProtectionSuspended, account.ProtectionSuspendReason = true, reason
-					account.UpdatedAt, account.TrafficBillingMonth = now.Unix(), now.Format("2006-01")
-					// CMS may be delayed or temporarily unavailable. A failed CMS
-					// request must not skip the independent CDT safety check.
-					if available := w.applyTrafficProtection(ctx, client, &account, now, threshold, thresholdAction, shutdownMode, account.TrafficUsed, false, keepAlive, monthlyAutoStart); available {
-						account.ProtectionSuspended, account.ProtectionSuspendReason = false, ""
-					}
-					if reason == "credential_invalid" && account.ProtectionNotifiedAt == 0 {
-						w.dispatchEvent(ctx, notify.Event{Title: "阿里云凭据异常", Summary: "已暂停自动停机保护", AccountID: accountLabel(account), Text: fmt.Sprintf("【ECS 控制台】阿里云凭据异常\n账号/实例: %s\n实例 ID: %s\n错误: %s\n系统已暂停自动停机保护，请更新 AK 后恢复。", accountLabel(account), account.InstanceID, trafficErr.Error()), Fields: map[string]string{"instance_id": account.InstanceID, "reason": "credential_invalid"}})
-						account.ProtectionNotifiedAt = now.Unix()
-					}
-					if err := w.Store.UpsertAccount(account); err != nil {
-						w.Store.AddLog("error", "保存流量保护状态失败: "+err.Error())
-					}
-					continue
-				}
-				account.TrafficUsed = traffic
-				account.TrafficBillingMonth = now.Format("2006-01")
-				account.TrafficAPIStatus, account.TrafficAPIMessage, account.ProtectionSuspended, account.ProtectionSuspendReason = trafficStatus, trafficMessage, false, ""
-				if account.ProtectionNotifiedAt != 0 {
-					account.ProtectionNotifiedAt = 0
-				}
-				_ = w.Store.AddTrafficHistory(account.ID, traffic, now)
-				if enableBilling && account.InstanceID != "" {
-					cycle := now.Format("2006-01")
-					if billingClient, ok := client.(cloud.BillingClient); ok {
-						if _, cacheOK := w.Store.GetBillingCache(account.ID, "balance", "", 6*time.Hour); !cacheOK {
-							if balance, currency, balanceErr := billingClient.GetAccountBalance(ctx, account.SiteType); balanceErr == nil {
-								_ = w.Store.SetBillingCache(account.ID, "balance", "", map[string]any{"balance": balance, "currency": currency})
-							} else {
-								_ = w.Store.SetBillingCache(account.ID, "balance", "", map[string]any{"error": balanceErr.Error()})
-							}
-						}
-						if _, cacheOK := w.Store.GetBillingCache(account.ID, "bill_overview", cycle, 6*time.Hour); !cacheOK {
-							if total, currency, overviewErr := billingClient.GetBillOverview(ctx, account.SiteType, cycle); overviewErr == nil {
-								_ = w.Store.SetBillingCache(account.ID, "bill_overview", cycle, map[string]any{"monthly_cost": total, "currency": currency})
-							} else {
-								_ = w.Store.SetBillingCache(account.ID, "bill_overview", cycle, map[string]any{"error": overviewErr.Error()})
-							}
-						}
-					}
-					if _, ok := w.Store.GetBillingCache(account.ID, "instance_bill", cycle, 6*time.Hour); !ok {
-						balance, monthlyCost, currency, billingErr := client.GetBilling(ctx, account.SiteType, account.InstanceID, cycle)
-						if billingErr != nil {
-							_ = w.Store.SetBillingCache(account.ID, "instance_bill", cycle, map[string]any{"error": billingErr.Error()})
-						} else {
-							_ = w.Store.SetBillingCache(account.ID, "instance_bill", cycle, map[string]any{"monthly_cost": monthlyCost, "balance": balance, "currency": currency})
-						}
-					}
-				}
-				w.applyTrafficProtection(ctx, client, &account, now, threshold, thresholdAction, shutdownMode, traffic, true, keepAlive, monthlyAutoStart)
-				if err := w.Store.UpsertAccount(account); err != nil {
-					w.Store.AddLog("error", "保存监控状态失败: "+err.Error())
-				}
-				if account.PublicIP != "" && account.PublicIP != oldPublicIP {
-					w.dispatchEvent(ctx, notify.Event{Title: "公网 IP 已变化", Summary: fmt.Sprintf("%s 公网 IP 已从 %s 变为 %s", accountLabel(account), oldPublicIP, account.PublicIP), AccountID: accountLabel(account), Text: fmt.Sprintf("【ECS 控制台】公网 IP 已变化\n实例: %s\n实例 ID: %s\n旧 IP: %s\n新 IP: %s\n时间: %s", accountLabel(account), account.InstanceID, oldPublicIP, account.PublicIP, time.Now().Format("2006-01-02 15:04:05")), Fields: map[string]string{"old_ip": oldPublicIP, "new_ip": account.PublicIP, "instance_id": account.InstanceID}})
-				}
-			}
-			w.runDailyTrafficSummary(ctx, now)
+		case <-timer.C:
+			w.runMonitorCycle(ctx, interval)
+			timer.Reset(interval)
 		}
 	}
+}
+
+func (w *Worker) runMonitorCycle(ctx context.Context, interval time.Duration) {
+	w.Store.SetLastRun()
+	now := time.Now()
+	started := w.beginRuntime(runtimeInstanceMonitor, "正在检查实例状态与流量", now.Add(interval))
+	if err := w.Store.ResetMonthlyTraffic(); err != nil {
+		w.Store.AddLog("warning", "月度流量状态重置失败: "+err.Error())
+	}
+	maintenanceDay := now.Format("2006-01-02")
+	if w.Store.GetSetting("maintenance_day", "") != maintenanceDay {
+		if err := w.Store.PruneMaintenance(now); err != nil {
+			w.Store.AddLog("warning", "数据库历史清理失败: "+err.Error())
+		}
+		if now.Hour() == 4 {
+			if err := w.Store.Vacuum(); err != nil {
+				w.Store.AddLog("warning", "数据库 VACUUM 失败: "+err.Error())
+			}
+		}
+		_ = w.Store.SetSetting("maintenance_day", maintenanceDay)
+	}
+	accounts, err := w.Store.LoadAccounts(false)
+	if err != nil {
+		w.Store.AddLog("error", "读取监控账号失败: "+err.Error())
+		w.finishRuntime(runtimeInstanceMonitor, started, "实例列表读取失败", time.Now().Add(interval), err)
+		return
+	}
+	threshold, _ := strconv.ParseFloat(w.Store.GetSetting("traffic_threshold", "95"), 64)
+	if threshold <= 0 || threshold > 100 {
+		threshold = 95
+	}
+	thresholdAction := w.Store.GetSetting("threshold_action", "stop_and_notify")
+	shutdownMode := w.Store.GetSetting("shutdown_mode", "KeepCharging")
+	keepAlive := w.Store.GetSetting("keep_alive", "0") == "1"
+	monthlyAutoStart := w.Store.GetSetting("monthly_auto_start", "0") == "1"
+	enableBilling := w.Store.GetSetting("enable_billing", "0") == "1"
+	apiInterval, _ := strconv.ParseInt(w.Store.GetSetting("api_interval", "600"), 10, 64)
+	if apiInterval < 30 {
+		apiInterval = 600
+	}
+
+	grouped := make(map[string][]app.Account)
+	groupOrder := make([]string, 0)
+	for _, account := range accounts {
+		if account.InstanceID == "" {
+			continue
+		}
+		key := account.GroupKey
+		if key == "" {
+			key = account.AccessKeyID + "|" + account.RegionID
+		}
+		if _, exists := grouped[key]; !exists {
+			groupOrder = append(groupOrder, key)
+		}
+		grouped[key] = append(grouped[key], account)
+	}
+
+	semaphore := make(chan struct{}, 3)
+	results := make(chan error, len(accounts))
+	var wg sync.WaitGroup
+	for _, key := range groupOrder {
+		groupAccounts := grouped[key]
+		wg.Add(1)
+		go func(items []app.Account) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			for _, account := range items {
+				accountCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+				runErr := w.monitorAccount(accountCtx, account, now, apiInterval, threshold, thresholdAction, shutdownMode, keepAlive, monthlyAutoStart, enableBilling)
+				cancel()
+				results <- runErr
+			}
+		}(groupAccounts)
+	}
+	wg.Wait()
+	close(results)
+	failures := 0
+	for runErr := range results {
+		if runErr != nil {
+			failures++
+		}
+	}
+	w.runDailyTrafficSummary(ctx, now)
+	w.runBillingAlerts(ctx, now)
+	w.updateDependentRuntime(now)
+	detail := fmt.Sprintf("%d 台实例，%d 个账号组", len(accounts), len(groupOrder))
+	var cycleErr error
+	if failures > 0 {
+		detail += fmt.Sprintf("，%d 台检查异常", failures)
+		cycleErr = fmt.Errorf("%d 台实例检查异常", failures)
+	}
+	w.Store.AddLog("heartbeat", "监控心跳正常："+detail+"。")
+	w.finishRuntime(runtimeInstanceMonitor, started, detail, time.Now().Add(interval), cycleErr)
+}
+
+func (w *Worker) monitorAccount(ctx context.Context, account app.Account, now time.Time, apiInterval int64, threshold float64, thresholdAction, shutdownMode string, keepAlive, monthlyAutoStart, enableBilling bool) error {
+	client := w.cloudClient(app.AccountGroup{AccessKeyID: account.AccessKeyID, AccessKeySecret: account.AccessKeySecret, RegionID: account.RegionID, SiteType: account.SiteType})
+	if client == nil {
+		return fmt.Errorf("实例 %s 的云客户端未配置", account.InstanceID)
+	}
+	transient := account.InstanceStatus == "Starting" || account.InstanceStatus == "Stopping" || account.InstanceStatus == "Pending" || account.InstanceStatus == "Unknown"
+	shouldRefresh := account.UpdatedAt <= 0 || now.Unix()-account.UpdatedAt >= apiInterval || transient || now.Minute() == 0
+	if !shouldRefresh {
+		w.runCachedAutomation(ctx, client, &account, now, threshold, thresholdAction, shutdownMode, keepAlive, monthlyAutoStart)
+		return ctx.Err()
+	}
+	oldPublicIP := account.PublicIP
+	oldStatus := account.InstanceStatus
+	instance, describeErr := client.DescribeInstance(ctx, account.RegionID, account.InstanceID)
+	if describeErr != nil {
+		if removed, cleanupErr := w.queueMissingInstanceCleanup(account, describeErr); cleanupErr != nil {
+			w.Store.AddLog("warning", "清理云端不存在的实例记录失败: "+cleanupErr.Error())
+			return cleanupErr
+		} else if removed {
+			return nil
+		}
+		metadata := map[string]any{"health_status": "error", "traffic_api_status": "unknown", "traffic_api_message": describeErr.Error()}
+		if cloud.IsCredentialError(describeErr) {
+			metadata["protection_suspended"] = true
+			metadata["protection_suspend_reason"] = "credential_invalid"
+			if account.ProtectionNotifiedAt == 0 {
+				w.dispatchEvent(ctx, notify.Event{Title: "阿里云凭据异常", Summary: "已暂停自动停机保护", AccountID: accountLabel(account), Text: fmt.Sprintf("【ECS 控制台】阿里云凭据异常\n账号/实例: %s\n实例 ID: %s\n区域: %s\n错误: %s\n系统已暂停自动停机保护，请更新 AK 后恢复。", accountLabel(account), account.InstanceID, account.RegionID, describeErr.Error()), Fields: map[string]string{"instance_id": account.InstanceID, "reason": "credential_invalid"}})
+				account.ProtectionNotifiedAt = now.Unix()
+				metadata["protection_suspend_notified_at"] = account.ProtectionNotifiedAt
+			}
+		}
+		_ = w.Store.UpdateAccountStatus(account.ID, account.TrafficUsed, account.InstanceStatus, now.Unix(), metadata)
+		return describeErr
+	}
+	account.InstanceStatus, account.PublicIP, account.PrivateIP, account.InstanceType = instance.Status, instance.PublicIP, instance.PrivateIP, instance.InstanceType
+	if account.PublicIPMode == "eip" && account.EIPAddress != "" {
+		account.PublicIP = account.EIPAddress
+	}
+	account.HealthStatus, account.UpdatedAt = "ok", now.Unix()
+	if oldStatus != "" && oldStatus != account.InstanceStatus {
+		w.dispatchEvent(ctx, statusEvent(account, oldStatus, account.InstanceStatus, "系统监控检测到实例状态变化。"))
+	}
+	traffic, trafficStatus, trafficMessage, trafficErr := w.refreshTraffic(ctx, client, account, now)
+	if trafficErr != nil {
+		reason := "traffic_api_error"
+		if cloud.IsCredentialError(trafficErr) {
+			reason = "credential_invalid"
+		}
+		account.TrafficAPIStatus, account.TrafficAPIMessage = "error", trafficMessage
+		account.ProtectionSuspended, account.ProtectionSuspendReason = true, reason
+		account.UpdatedAt, account.TrafficBillingMonth = now.Unix(), now.Format("2006-01")
+		if available := w.applyTrafficProtection(ctx, client, &account, now, threshold, thresholdAction, shutdownMode, account.TrafficUsed, false, keepAlive, monthlyAutoStart); available {
+			account.ProtectionSuspended, account.ProtectionSuspendReason = false, ""
+		}
+		if reason == "credential_invalid" && account.ProtectionNotifiedAt == 0 {
+			w.dispatchEvent(ctx, notify.Event{Title: "阿里云凭据异常", Summary: "已暂停自动停机保护", AccountID: accountLabel(account), Text: fmt.Sprintf("【ECS 控制台】阿里云凭据异常\n账号/实例: %s\n实例 ID: %s\n错误: %s\n系统已暂停自动停机保护，请更新 AK 后恢复。", accountLabel(account), account.InstanceID, trafficErr.Error()), Fields: map[string]string{"instance_id": account.InstanceID, "reason": "credential_invalid"}})
+			account.ProtectionNotifiedAt = now.Unix()
+		}
+		if err := w.Store.UpsertAccount(account); err != nil {
+			w.Store.AddLog("error", "保存流量保护状态失败: "+err.Error())
+			return err
+		}
+		return trafficErr
+	}
+	account.TrafficUsed = traffic
+	account.TrafficBillingMonth = now.Format("2006-01")
+	account.TrafficAPIStatus, account.TrafficAPIMessage, account.ProtectionSuspended, account.ProtectionSuspendReason = trafficStatus, trafficMessage, false, ""
+	if account.ProtectionNotifiedAt != 0 {
+		account.ProtectionNotifiedAt = 0
+	}
+	_ = w.Store.AddTrafficHistory(account.ID, traffic, now)
+	if enableBilling && account.InstanceID != "" {
+		cycle := now.Format("2006-01")
+		if billingClient, ok := client.(cloud.BillingClient); ok {
+			if _, cacheOK := w.Store.GetBillingCache(account.ID, "balance", "", 6*time.Hour); !cacheOK {
+				if balance, currency, balanceErr := billingClient.GetAccountBalance(ctx, account.SiteType); balanceErr == nil {
+					_ = w.Store.SetBillingCache(account.ID, "balance", "", map[string]any{"balance": balance, "currency": currency})
+				} else {
+					_ = w.Store.SetBillingCache(account.ID, "balance", "", map[string]any{"error": balanceErr.Error()})
+				}
+			}
+			if _, cacheOK := w.Store.GetBillingCache(account.ID, "bill_overview", cycle, 6*time.Hour); !cacheOK {
+				if total, currency, overviewErr := billingClient.GetBillOverview(ctx, account.SiteType, cycle); overviewErr == nil {
+					_ = w.Store.SetBillingCache(account.ID, "bill_overview", cycle, map[string]any{"monthly_cost": total, "currency": currency})
+				} else {
+					_ = w.Store.SetBillingCache(account.ID, "bill_overview", cycle, map[string]any{"error": overviewErr.Error()})
+				}
+			}
+		}
+		if _, ok := w.Store.GetBillingCache(account.ID, "instance_bill", cycle, 6*time.Hour); !ok {
+			balance, monthlyCost, currency, billingErr := client.GetBilling(ctx, account.SiteType, account.InstanceID, cycle)
+			if billingErr != nil {
+				_ = w.Store.SetBillingCache(account.ID, "instance_bill", cycle, map[string]any{"error": billingErr.Error()})
+			} else {
+				_ = w.Store.SetBillingCache(account.ID, "instance_bill", cycle, map[string]any{"monthly_cost": monthlyCost, "balance": balance, "currency": currency})
+			}
+		}
+	}
+	w.applyTrafficProtection(ctx, client, &account, now, threshold, thresholdAction, shutdownMode, traffic, true, keepAlive, monthlyAutoStart)
+	if err := w.Store.UpsertAccount(account); err != nil {
+		w.Store.AddLog("error", "保存监控状态失败: "+err.Error())
+		return err
+	}
+	if account.PublicIP != "" && account.PublicIP != oldPublicIP {
+		w.dispatchEvent(ctx, notify.Event{Title: "公网 IP 已变化", Summary: fmt.Sprintf("%s 公网 IP 已从 %s 变为 %s", accountLabel(account), oldPublicIP, account.PublicIP), AccountID: accountLabel(account), Text: fmt.Sprintf("【ECS 控制台】公网 IP 已变化\n实例: %s\n实例 ID: %s\n旧 IP: %s\n新 IP: %s\n时间: %s", accountLabel(account), account.InstanceID, oldPublicIP, account.PublicIP, time.Now().Format("2006-01-02 15:04:05")), Fields: map[string]string{"old_ip": oldPublicIP, "new_ip": account.PublicIP, "instance_id": account.InstanceID}})
+	}
+	return ctx.Err()
 }
 
 // queueMissingInstanceCleanup hides a stale row as soon as the per-instance
@@ -346,6 +357,7 @@ func (w *Worker) runCachedAutomation(ctx context.Context, client cloud.Client, a
 		if thresholdAction == "stop_and_notify" && account.InstanceStatus == "Running" {
 			if err := client.StopInstance(ctx, account.RegionID, account.InstanceID, shutdownMode); err != nil {
 				w.Store.AddLog("error", "流量阈值停机失败: "+err.Error())
+				w.audit(app.AuditSourceProtection, "traffic_threshold_stop", "instance", auditAccountID(*account), "流量达到阈值，提交停机", err)
 			} else {
 				old := account.InstanceStatus
 				account.InstanceStatus = "Stopping"
@@ -355,6 +367,7 @@ func (w *Worker) runCachedAutomation(ctx context.Context, client cloud.Client, a
 				w.dispatchEvent(ctx, statusEvent(*account, old, "Stopping", fmt.Sprintf("%s 流量达到保护阈值，已提交停机。", protectionSource)))
 				w.dispatchEvent(ctx, trafficEvent(*account, protectionTraffic, usagePercent, threshold, fmt.Sprintf("已达到阈值，已提交停机（来源：%s）", protectionSource)))
 				account.ProtectionNotifiedAt = now.Unix()
+				w.audit(app.AuditSourceProtection, "traffic_threshold_stop", "instance", auditAccountID(*account), fmt.Sprintf("流量使用率 %.2f%%，已提交停机", usagePercent), nil)
 			}
 		} else if thresholdAction == "notify_only" && (account.ProtectionNotifiedAt == 0 || now.Unix()-account.ProtectionNotifiedAt >= 6*60*60) {
 			w.dispatchEvent(ctx, trafficEvent(*account, protectionTraffic, usagePercent, threshold, fmt.Sprintf("仅发送告警（来源：%s）", protectionSource)))
@@ -409,6 +422,7 @@ func (w *Worker) applyTrafficProtection(ctx context.Context, client cloud.Client
 	if requiresProtection && thresholdAction == "stop_and_notify" && account.InstanceStatus == "Running" {
 		if err := client.StopInstance(ctx, account.RegionID, account.InstanceID, shutdownMode); err != nil {
 			w.Store.AddLog("error", "流量阈值停机失败: "+err.Error())
+			w.audit(app.AuditSourceProtection, "traffic_threshold_stop", "instance", auditAccountID(*account), "流量达到阈值，提交停机", err)
 		} else {
 			old := account.InstanceStatus
 			account.InstanceStatus = "Stopping"
@@ -417,6 +431,7 @@ func (w *Worker) applyTrafficProtection(ctx context.Context, client cloud.Client
 			w.Store.AddLog("warning", fmt.Sprintf("实例已达到流量保护阈值，已发起停机: %s (%.2f%%, 来源: %s)", account.InstanceID, usagePercent, protectionSource))
 			w.dispatchEvent(ctx, statusEvent(*account, old, "Stopping", fmt.Sprintf("%s 流量达到保护阈值，已提交停机。", protectionSource)))
 			protectionAction = fmt.Sprintf("已达到阈值，已提交停机（来源：%s）", protectionSource)
+			w.audit(app.AuditSourceProtection, "traffic_threshold_stop", "instance", auditAccountID(*account), fmt.Sprintf("流量使用率 %.2f%%，已提交停机", usagePercent), nil)
 		}
 	}
 	if requiresProtection && thresholdAction == "notify_only" {
@@ -507,6 +522,9 @@ func (w *Worker) runSchedule(ctx context.Context, client cloud.Client, account *
 				_ = w.Store.UpdateScheduleExecutionState(account.ID, "stop", today)
 				w.Store.AddLog("info", "执行定时停机: "+account.InstanceID)
 				w.dispatchEvent(ctx, statusEvent(*account, "Running", "Stopping", "已按计划时间执行定时停机。"))
+				w.audit(app.AuditSourceSchedule, "scheduled_stop", "instance", auditAccountID(*account), "按实例计划执行定时停机", nil)
+			} else {
+				w.audit(app.AuditSourceSchedule, "scheduled_stop", "instance", auditAccountID(*account), "按实例计划执行定时停机", err)
 			}
 		} else if account.InstanceStatus == "Stopped" || account.InstanceStatus == "Stopping" {
 			account.ScheduleStopActive = true
@@ -530,6 +548,9 @@ func (w *Worker) runSchedule(ctx context.Context, client cloud.Client, account *
 				_ = w.Store.UpdateScheduleExecutionState(account.ID, "start", today)
 				w.Store.AddLog("info", "执行定时开机: "+account.InstanceID)
 				w.dispatchEvent(ctx, statusEvent(*account, "Stopped", "Starting", "已按计划时间执行定时开机。"))
+				w.audit(app.AuditSourceSchedule, "scheduled_start", "instance", auditAccountID(*account), "按实例计划执行定时开机", nil)
+			} else {
+				w.audit(app.AuditSourceSchedule, "scheduled_start", "instance", auditAccountID(*account), "按实例计划执行定时开机", err)
 			}
 		} else if account.InstanceStatus == "Running" {
 			account.ScheduleStopActive = false
@@ -573,6 +594,7 @@ func (w *Worker) Run(ctx context.Context) {
 	if w.Log == nil {
 		w.Log = log.Default()
 	}
+	w.setRuntimeWaiting(runtimeJobQueue, "后台任务队列空闲", time.Time{})
 	for {
 		select {
 		case <-ctx.Done():
@@ -582,6 +604,8 @@ func (w *Worker) Run(ctx context.Context) {
 		job, err := w.Store.ClaimJob(2 * time.Minute)
 		if err != nil {
 			w.Log.Printf("claim job: %v", err)
+			started := w.beginRuntime(runtimeJobQueue, "正在读取后台任务", time.Time{})
+			w.finishRuntime(runtimeJobQueue, started, "后台任务读取失败", time.Time{}, err)
 			sleep(ctx, 2*time.Second)
 			continue
 		}
@@ -589,6 +613,7 @@ func (w *Worker) Run(ctx context.Context) {
 			sleep(ctx, time.Second)
 			continue
 		}
+		started := w.beginRuntime(runtimeJobQueue, "正在执行 "+job.Kind, time.Time{})
 		if err := w.execute(ctx, job); err != nil {
 			w.Log.Printf("job %s: %v", job.JobID, err)
 			maxAttempts := 5
@@ -606,6 +631,7 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			if job.Attempts < maxAttempts {
 				_ = w.Store.RetryJob(job.JobID, retryDelay(job.Attempts), err.Error())
+				w.finishRuntime(runtimeJobQueue, started, "任务执行失败，已进入重试", time.Time{}, err)
 			} else {
 				if job.Kind == "delete_instance" {
 					if id, parseErr := strconv.ParseInt(job.EntityKey, 10, 64); parseErr == nil {
@@ -613,10 +639,27 @@ func (w *Worker) Run(ctx context.Context) {
 					}
 				}
 				_ = w.Store.FailJob(job.JobID, err.Error())
+				w.finishRuntime(runtimeJobQueue, started, "任务已达到最大重试次数", time.Time{}, err)
+				action, entityType, summary := "job_execute", "job", "后台任务执行失败"
+				if job.Kind == "create_ecs" {
+					action, entityType, summary = "ecs_create", "ecs_task", "ECS 创建任务失败"
+				} else if job.Kind == "delete_instance" {
+					action, entityType, summary = "instance_release", "instance", "实例释放任务失败"
+				}
+				w.audit(app.AuditSourceJob, action, entityType, job.EntityKey, summary, err)
 			}
 			continue
 		}
 		_ = w.Store.FinishJob(job.JobID)
+		action, entityType, summary := "job_execute", "job", "后台任务执行完成"
+		if job.Kind == "create_ecs" {
+			action, entityType, summary = "ecs_create", "ecs_task", "ECS 创建任务完成"
+		} else if job.Kind == "delete_instance" {
+			action, entityType, summary = "instance_release", "instance", "实例释放任务完成"
+		}
+		w.audit(app.AuditSourceJob, action, entityType, job.EntityKey, summary, nil)
+		w.finishRuntime(runtimeJobQueue, started, "已完成 "+job.Kind, time.Time{}, nil)
+		w.setRuntimeWaiting(runtimeJobQueue, "后台任务队列空闲", time.Time{})
 	}
 }
 

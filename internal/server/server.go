@@ -296,6 +296,13 @@ func (s *Server) authenticatedAction(w http.ResponseWriter, r *http.Request, act
 		return
 	}
 	data, _ := readJSON(r)
+	if meta, ok := webAuditMetadata(action, data); ok {
+		requestID := app.NewAuditRequestID("web")
+		audited := &auditResponseWriter{ResponseWriter: w}
+		audited.Header().Set("X-Request-ID", requestID)
+		defer s.auditWebResult(requestID, meta, audited)
+		w = audited
+	}
 	switch action {
 	case "get_status":
 		s.status(w)
@@ -307,6 +314,10 @@ func (s *Server) authenticatedAction(w http.ResponseWriter, r *http.Request, act
 		s.checkForUpdate(w, r)
 	case "get_update_status":
 		s.updateStatus(w)
+	case "get_runtime_status":
+		s.runtimeStatus(w)
+	case "retry_runtime_job":
+		s.retryRuntimeJob(w, data)
 	case "save_config":
 		if err := s.saveConfig(data); err != nil {
 			s.error(w, 400, err.Error())
@@ -317,6 +328,8 @@ func (s *Server) authenticatedAction(w http.ResponseWriter, r *http.Request, act
 		s.startUpdate(w, r, data)
 	case "get_logs":
 		s.json(w, 200, map[string]any{"data": s.Store.Logs(r.URL.Query().Get("tab"), 20)})
+	case "get_audit_logs":
+		s.auditLogs(w, r)
 	case "clear_logs":
 		if err := s.Store.ClearLogs(stringValue(data["tab"])); err != nil {
 			s.error(w, 500, "清空失败")
@@ -337,6 +350,8 @@ func (s *Server) authenticatedAction(w http.ResponseWriter, r *http.Request, act
 		s.json(w, 200, map[string]any{"data": history})
 	case "get_bill_details":
 		s.billDetails(w, r, data)
+	case "get_billing_analysis":
+		s.billingAnalysis(w, r)
 	case "logout":
 		s.logout(w, r)
 	case "get_all_instances":
@@ -450,7 +465,7 @@ func (s *Server) config(w http.ResponseWriter) {
 			m.used = m.fallbackUsed
 		}
 	}
-	result := map[string]any{"admin_username": settings["admin_username"], "admin_password": "********", "admin_password_set": s.Store.IsInitialized(), "password_login_enabled": settingBool(settings["password_login_enabled"], true), "passkey_count": s.Store.PasskeyCount(), "traffic_threshold": numberString(settings["traffic_threshold"], 95), "shutdown_mode": fallback(settings["shutdown_mode"], "KeepCharging"), "threshold_action": fallback(settings["threshold_action"], "stop_and_notify"), "keep_alive": settings["keep_alive"] == "1", "monthly_auto_start": settings["monthly_auto_start"] == "1", "api_interval": numberString(settings["api_interval"], 600), "inventory_sync_enabled": settingBool(settings["inventory_sync_enabled"], true), "inventory_sync_interval": numberString(settings["inventory_sync_interval"], 3600), "enable_billing": settings["enable_billing"] == "1", "AppBrand": map[string]any{"logo_url": settings["app_logo_url"]}, "Notification": notificationSettings(settings), "RotationGroups": rotationGroups, "Accounts": []any{}}
+	result := map[string]any{"admin_username": settings["admin_username"], "admin_password": "********", "admin_password_set": s.Store.IsInitialized(), "password_login_enabled": settingBool(settings["password_login_enabled"], true), "passkey_count": s.Store.PasskeyCount(), "traffic_threshold": numberString(settings["traffic_threshold"], 95), "shutdown_mode": fallback(settings["shutdown_mode"], "KeepCharging"), "threshold_action": fallback(settings["threshold_action"], "stop_and_notify"), "keep_alive": settings["keep_alive"] == "1", "monthly_auto_start": settings["monthly_auto_start"] == "1", "api_interval": numberString(settings["api_interval"], 600), "inventory_sync_enabled": settingBool(settings["inventory_sync_enabled"], true), "inventory_sync_interval": numberString(settings["inventory_sync_interval"], 3600), "enable_billing": settings["enable_billing"] == "1", "billing_cost_threshold": numberString(settings["billing_cost_threshold"], 0), "billing_balance_threshold": numberString(settings["billing_balance_threshold"], 0), "AppBrand": map[string]any{"logo_url": settings["app_logo_url"]}, "Notification": notificationSettings(settings), "RotationGroups": rotationGroups, "Accounts": []any{}}
 	items := result["Accounts"].([]any)
 	for _, g := range groups {
 		m := metrics[g.GroupKey]
@@ -777,6 +792,11 @@ func (s *Server) saveConfig(data map[string]any) error {
 	if threshold < 1 || threshold > 100 {
 		return fmt.Errorf("流量阈值必须在 1 到 100 之间")
 	}
+	billingCostThreshold := numberFloat(data["billing_cost_threshold"])
+	billingBalanceThreshold := numberFloat(data["billing_balance_threshold"])
+	if billingCostThreshold < 0 || billingCostThreshold > 1_000_000_000 || billingBalanceThreshold < 0 || billingBalanceThreshold > 1_000_000_000 {
+		return fmt.Errorf("费用和余额告警阈值必须在 0 到 10 亿之间")
+	}
 	interval := number(data["api_interval"], 600)
 	if interval < 30 || interval > 86400 {
 		return fmt.Errorf("API 间隔必须在 30 到 86400 秒之间")
@@ -806,7 +826,7 @@ func (s *Server) saveConfig(data map[string]any) error {
 			return err
 		}
 	}
-	for key, value := range map[string]any{"traffic_threshold": threshold, "shutdown_mode": fallback(stringValue(data["shutdown_mode"]), "KeepCharging"), "threshold_action": fallback(stringValue(data["threshold_action"]), "stop_and_notify"), "keep_alive": bool01(data["keep_alive"]), "monthly_auto_start": bool01(data["monthly_auto_start"]), "api_interval": interval, "inventory_sync_enabled": bool01(inventoryEnabled), "inventory_sync_interval": inventoryInterval, "enable_billing": bool01(data["enable_billing"]), "password_login_enabled": bool01(passwordLoginEnabled)} {
+	for key, value := range map[string]any{"traffic_threshold": threshold, "shutdown_mode": fallback(stringValue(data["shutdown_mode"]), "KeepCharging"), "threshold_action": fallback(stringValue(data["threshold_action"]), "stop_and_notify"), "keep_alive": bool01(data["keep_alive"]), "monthly_auto_start": bool01(data["monthly_auto_start"]), "api_interval": interval, "inventory_sync_enabled": bool01(inventoryEnabled), "inventory_sync_interval": inventoryInterval, "enable_billing": bool01(data["enable_billing"]), "billing_cost_threshold": billingCostThreshold, "billing_balance_threshold": billingBalanceThreshold, "password_login_enabled": bool01(passwordLoginEnabled)} {
 		if err := s.Store.SetSetting(key, fmt.Sprint(value)); err != nil {
 			return err
 		}
@@ -1957,191 +1977,6 @@ func (s *Server) syncAllInstances(w http.ResponseWriter) {
 	s.status(w)
 }
 
-func (s *Server) syncGroup(groupKey string) (int, error) {
-	s.inventoryMu.Lock()
-	defer s.inventoryMu.Unlock()
-	return s.syncGroupContext(rctx(), groupKey, false)
-}
-
-// SyncInventory reconciles all configured account groups in the background.
-// Automatic reconciliation requires two successful missing observations before
-// it starts the existing local cleanup flow for an externally removed ECS.
-func (s *Server) SyncInventory(ctx context.Context) (int, error) {
-	s.inventoryMu.Lock()
-	defer s.inventoryMu.Unlock()
-	groups, err := s.Store.LoadGroups()
-	if err != nil {
-		return 0, err
-	}
-	total := 0
-	var failures []string
-	for _, group := range groups {
-		groupCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		count, syncErr := s.syncGroupContext(groupCtx, group.GroupKey, true)
-		cancel()
-		total += count
-		if syncErr != nil {
-			failures = append(failures, group.GroupKey+": "+syncErr.Error())
-		}
-	}
-	if len(failures) > 0 {
-		return total, fmt.Errorf("部分账号组同步失败: %s", strings.Join(failures, "; "))
-	}
-	return total, nil
-}
-
-func (s *Server) syncGroupContext(ctx context.Context, groupKey string, confirmMissing bool) (int, error) {
-	groups, err := s.Store.LoadGroups()
-	if err != nil {
-		return 0, err
-	}
-	var group *app.AccountGroup
-	for i := range groups {
-		if groups[i].GroupKey == groupKey {
-			group = &groups[i]
-			break
-		}
-	}
-	if group == nil {
-		return 0, fmt.Errorf("账号组不存在")
-	}
-	client := s.cloudClient(app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, SiteType: group.SiteType})
-	if client == nil {
-		return 0, fmt.Errorf("云客户端未配置")
-	}
-	instances, err := client.DescribeInstances(ctx, group.RegionID)
-	if err != nil {
-		return 0, err
-	}
-	accounts, err := s.Store.LoadAccounts(true)
-	if err != nil {
-		return 0, err
-	}
-	publicNetworks := map[string]cloud.InstancePublicNetwork{}
-	publicNetworkSynced := false
-	if networkClient, ok := client.(cloud.InstancePublicNetworkClient); ok {
-		instanceIDs := make([]string, 0, len(instances))
-		for _, instance := range instances {
-			instanceIDs = append(instanceIDs, instance.ID)
-		}
-		if networks, networkErr := networkClient.DescribeInstancePublicNetworks(ctx, group.RegionID, instanceIDs); networkErr != nil {
-			s.Log.Printf("同步实例公网带宽失败（账号组 %s）: %v", group.GroupKey, networkErr)
-		} else {
-			publicNetworks = networks
-			publicNetworkSynced = true
-		}
-	}
-	remoteIDs := make(map[string]bool, len(instances))
-	count := 0
-	for _, instance := range instances {
-		remoteIDs[instance.ID] = true
-		count++
-		var existing *app.Account
-		for i := range accounts {
-			sameGroup := accounts[i].GroupKey == group.GroupKey || (accounts[i].AccessKeyID == group.AccessKeyID && accounts[i].RegionID == group.RegionID)
-			if sameGroup && accounts[i].InstanceID == instance.ID {
-				existing = &accounts[i]
-				break
-			}
-		}
-		if existing != nil {
-			_ = s.Store.SetSetting(inventoryMissingKey(existing.ID), "0")
-		}
-		if existing != nil && (existing.IsDeleted != 0 || existing.InstanceStatus == "Releasing") {
-			// A user-triggered release must not be resurrected by a manual sync
-			// while the remote ECS record is still visible.
-			continue
-		}
-		a := app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, InstanceID: instance.ID, MaxTraffic: group.MaxTraffic, Remark: group.Remark, SiteType: group.SiteType, GroupKey: group.GroupKey, InstanceName: instance.Name, InstanceType: instance.InstanceType, InternetBandwidth: instance.InternetBandwidth, PublicIP: instance.PublicIP, PublicIPMode: "ecs_public_ip", PrivateIP: instance.PrivateIP, CPU: instance.CPU, Memory: instance.Memory, OSName: instance.OSName, InstanceStatus: instance.Status, HealthStatus: "ok", UpdatedAt: time.Now().Unix()}
-		if network, hasEIP := publicNetworks[instance.ID]; hasEIP {
-			a.PublicIPMode = "eip"
-			a.EIPAllocationID, a.EIPAddress = network.AllocationID, network.Address
-			if network.Address != "" {
-				a.PublicIP = network.Address
-			}
-			if network.Bandwidth > 0 {
-				a.InternetBandwidth = network.Bandwidth
-			}
-		}
-		if existing != nil {
-			// Keep local runtime state (traffic, schedules, protection flags and
-			// managed-network metadata) while refreshing cloud-owned fields.
-			a.ID = existing.ID
-			a.TrafficUsed, a.TrafficBillingMonth = existing.TrafficUsed, existing.TrafficBillingMonth
-			a.LastKeepAliveAt, a.AutoStartBlocked = existing.LastKeepAliveAt, existing.AutoStartBlocked
-			a.ScheduleLastStartDate, a.ScheduleLastStopDate = existing.ScheduleLastStartDate, existing.ScheduleLastStopDate
-			a.ScheduleStopActive, a.ScheduleBlockedByTraffic = existing.ScheduleStopActive, existing.ScheduleBlockedByTraffic
-			a.ScheduleEnabled, a.ScheduleStartEnabled, a.ScheduleStopEnabled = existing.ScheduleEnabled, existing.ScheduleStartEnabled, existing.ScheduleStopEnabled
-			a.StartTime, a.StopTime = existing.StartTime, existing.StopTime
-			a.StoppedMode = existing.StoppedMode
-			a.TrafficAPIStatus, a.TrafficAPIMessage = existing.TrafficAPIStatus, existing.TrafficAPIMessage
-			a.ProtectionSuspended, a.ProtectionSuspendReason, a.ProtectionNotifiedAt = existing.ProtectionSuspended, existing.ProtectionSuspendReason, existing.ProtectionNotifiedAt
-			if network, hasEIP := publicNetworks[instance.ID]; hasEIP {
-				// Only controller-created EIPs may be replaced from the UI.
-				a.EIPManaged = existing.EIPManaged && existing.EIPAllocationID == network.AllocationID
-			} else if !publicNetworkSynced {
-				// A failed EIP lookup must not erase known network metadata.
-				a.EIPAllocationID, a.EIPAddress, a.EIPManaged = existing.EIPAllocationID, existing.EIPAddress, existing.EIPManaged
-				a.PublicIPMode = existing.PublicIPMode
-				if a.InternetBandwidth < 1 {
-					a.InternetBandwidth = existing.InternetBandwidth
-				}
-			}
-			if a.PublicIPMode == "eip" && a.EIPAddress != "" {
-				a.PublicIP = a.EIPAddress
-			}
-		}
-		if err := s.Store.UpsertAccount(a); err != nil {
-			return count, err
-		}
-	}
-	for _, account := range accounts {
-		if account.InstanceID == "" || account.IsDeleted != 0 || remoteIDs[account.InstanceID] {
-			continue
-		}
-		sameGroup := account.GroupKey == group.GroupKey || (account.AccessKeyID == group.AccessKeyID && account.RegionID == group.RegionID)
-		if !sameGroup {
-			continue
-		}
-		missingKey := inventoryMissingKey(account.ID)
-		if confirmMissing {
-			missingCount, _ := strconv.Atoi(s.Store.GetSetting(missingKey, "0"))
-			missingCount++
-			if err := s.Store.SetSetting(missingKey, strconv.Itoa(missingCount)); err != nil {
-				return count, err
-			}
-			if missingCount < 2 {
-				s.Store.AddLog("warning", "账号清单同步首次未发现实例，等待下次确认: "+account.InstanceID)
-				continue
-			}
-		}
-		_ = s.Store.SetSetting(missingKey, "0")
-		if account.InstanceStatus == "ReleaseFailed" {
-			// A failed release is safe to forget only after a successful,
-			// complete DescribeInstances response confirms this exact instance ID
-			// no longer exists. Never use a reused IP address for this decision.
-			if removed, removeErr := s.Store.PhysicallyDeleteReleaseFailed(account.ID); removeErr != nil {
-				return count, removeErr
-			} else if removed {
-				s.Store.AddLog("info", "已清理云端不存在的释放失败残留记录: "+account.InstanceID)
-			}
-			continue
-		}
-		// The instance disappeared outside this controller. Hide the stale row
-		// immediately and atomically queue EIP/DDNS/group cleanup. A terminal
-		// cleanup failure restores it as ReleaseFailed for manual intervention.
-		if err := s.Store.QueueMissingInstanceCleanup(account.ID, randomToken(16)); err != nil {
-			return count, err
-		}
-		s.Store.AddLog("info", "已同步移除云端不存在的实例: "+account.InstanceID)
-	}
-	return count, nil
-}
-
-func inventoryMissingKey(accountID int64) string {
-	return "inventory_missing_" + strconv.FormatInt(accountID, 10)
-}
-
 func (s *Server) fetchInstances(w http.ResponseWriter, data map[string]any) {
 	accessKey, secret, region := stringValue(data["accessKeyId"]), stringValue(data["accessKeySecret"]), stringValue(data["regionId"])
 	if accessKey == "" || secret == "" || region == "" {
@@ -2370,7 +2205,7 @@ func (s *Server) csrfOK(w http.ResponseWriter, r *http.Request) bool {
 }
 func (s *Server) mutating(a string) bool {
 	switch a {
-	case "save_config", "upload_logo", "clear_logs", "logout", "create_ecs", "control_instance", "save_instance_schedule", "delete_instance", "replace_instance_ip", "get_instance_initial_credential", "refresh_account", "sync_account_group", "sync_instances", "restore_schedule_block", "send_test_email", "send_test_telegram", "send_test_webhook", "start_update", "passkey_register_start", "passkey_register_finish":
+	case "save_config", "upload_logo", "clear_logs", "logout", "create_ecs", "control_instance", "save_instance_schedule", "delete_instance", "replace_instance_ip", "get_instance_initial_credential", "refresh_account", "sync_account_group", "sync_instances", "restore_schedule_block", "send_test_email", "send_test_telegram", "send_test_webhook", "start_update", "passkey_register_start", "passkey_register_finish", "retry_runtime_job":
 		return true
 	}
 	return false

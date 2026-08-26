@@ -157,6 +157,9 @@ func (s *Store) migrate() error {
 			protection_suspend_reason TEXT DEFAULT '', protection_suspend_notified_at INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, message TEXT, created_at INTEGER)`,
+		`CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL, source TEXT NOT NULL, action TEXT NOT NULL, entity_type TEXT DEFAULT '', entity_id TEXT DEFAULT '', summary TEXT NOT NULL, success INTEGER NOT NULL DEFAULT 0, error_message TEXT DEFAULT '', created_at INTEGER NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_logs_source_action ON audit_logs(source,action,created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, attempt_time INTEGER)`,
 		`CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, csrf_token TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS traffic_hourly (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER, traffic REAL, recorded_at INTEGER)`,
@@ -171,6 +174,7 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS passkey_credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, credential_id TEXT UNIQUE NOT NULL, credential_data TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS passkey_challenges (id TEXT PRIMARY KEY, kind TEXT NOT NULL, session_id TEXT DEFAULT '', session_data TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS rotation_states (group_id TEXT NOT NULL, account_id INTEGER NOT NULL, last_start_date TEXT DEFAULT '', last_stop_date TEXT DEFAULT '', dns_updated_date TEXT DEFAULT '', last_error TEXT DEFAULT '', PRIMARY KEY(group_id, account_id))`,
+		`CREATE TABLE IF NOT EXISTS runtime_status (component_key TEXT PRIMARY KEY, label TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'waiting', last_started_at INTEGER DEFAULT 0, last_success_at INTEGER DEFAULT 0, last_failure_at INTEGER DEFAULT 0, last_duration_ms INTEGER DEFAULT 0, next_run_at INTEGER DEFAULT 0, last_error TEXT DEFAULT '', detail TEXT DEFAULT '', updated_at INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.DB.Exec(statement); err != nil {
@@ -570,6 +574,9 @@ func (s *Store) PruneMaintenance(now time.Time) error {
 	}
 	_, err = s.DB.Exec(`DELETE FROM billing_cache WHERE updated_at<?`, now.Add(-90*24*time.Hour).Unix())
 	if err != nil {
+		return err
+	}
+	if _, err = s.DB.Exec(`DELETE FROM audit_logs WHERE created_at<?`, now.Add(-180*24*time.Hour).Unix()); err != nil {
 		return err
 	}
 	_, err = s.DB.Exec(`DELETE FROM instance_traffic_usage WHERE billing_month<?`, now.AddDate(0, -4, 0).Format("2006-01"))
