@@ -501,6 +501,28 @@ func TestPasskeyWebAuthnUsesForwardedBrowserOrigin(t *testing.T) {
 	}
 }
 
+func TestPasskeyUserUsesConfiguredAdminUsername(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SetAdminCredentials("operator.name", "secure-password"); err != nil {
+		t.Fatal(err)
+	}
+
+	user, err := New(st, t.TempDir(), "").passkeyUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := user.WebAuthnName(); got != "operator.name" {
+		t.Fatalf("Passkey username=%q, want operator.name", got)
+	}
+	if got := string(user.WebAuthnID()); got != passkeyUserHandle {
+		t.Fatalf("Passkey user handle=%q, want %q", got, passkeyUserHandle)
+	}
+}
+
 func TestNotificationSwitchesPersistAndReadBack(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

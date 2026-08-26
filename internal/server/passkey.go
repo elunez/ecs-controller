@@ -22,23 +22,28 @@ const (
 )
 
 type adminPasskeyUser struct {
+	username    string
 	credentials webauthn.Credentials
 }
 
 func (u *adminPasskeyUser) WebAuthnID() []byte { return []byte(passkeyUserHandle) }
 
-func (u *adminPasskeyUser) WebAuthnName() string { return "admin" }
+func (u *adminPasskeyUser) WebAuthnName() string { return u.username }
 
 func (u *adminPasskeyUser) WebAuthnDisplayName() string { return "ECS 控制台管理员" }
 
 func (u *adminPasskeyUser) WebAuthnCredentials() []webauthn.Credential { return u.credentials }
 
 func (s *Server) passkeyUser() (*adminPasskeyUser, error) {
+	username := strings.TrimSpace(s.Store.GetSetting("admin_username", ""))
+	if username == "" {
+		return nil, fmt.Errorf("passkey user has no admin username")
+	}
 	records, err := s.Store.PasskeyCredentials()
 	if err != nil {
 		return nil, err
 	}
-	user := &adminPasskeyUser{credentials: make(webauthn.Credentials, 0, len(records))}
+	user := &adminPasskeyUser{username: username, credentials: make(webauthn.Credentials, 0, len(records))}
 	for _, record := range records {
 		var credential webauthn.Credential
 		if err := json.Unmarshal([]byte(record.Data), &credential); err != nil {
