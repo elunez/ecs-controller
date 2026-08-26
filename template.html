@@ -2089,6 +2089,14 @@
 			white-space: nowrap;
 		}
 
+		.account-list-toolbar__actions {
+			display: flex;
+			align-items: center;
+			justify-content: flex-end;
+			gap: 10px;
+			margin-left: auto;
+		}
+
 		.account-list-empty {
 			padding: 28px 16px;
 			color: var(--muted);
@@ -4312,6 +4320,12 @@
 				grid-template-columns: 1fr;
 				width: 100%;
 			}
+
+			.account-list-toolbar__actions {
+				width: 100%;
+				justify-content: space-between;
+				margin-left: 0;
+			}
 		}
 
         .desktop-visible {
@@ -5304,7 +5318,6 @@
                                     <button @click="currentAccountTab = 'accounts'" class="ghost-button" :class="{ 'text-dark-button': currentAccountTab === 'accounts' }">账号管理</button>
                                     <button v-if="config.enable_billing" @click="currentAccountTab = 'billing'; fetchBillingAnalysis(false)" class="ghost-button" :class="{ 'text-dark-button': currentAccountTab === 'billing' }">费用分析</button>
                                 </div>
-                                <button @click="openCreateAccountModal" class="ghost-button">新增账号</button>
                             </div>
                         </div>
 
@@ -5353,7 +5366,10 @@
                                     <app-select v-model="accountFilter.siteType" class="glass-select" :options="accountSiteOptions" />
                                     <input v-model.trim="accountFilter.search" class="glass-input" placeholder="搜索账号备注或区域">
                                 </div>
-                                <span class="account-list-toolbar__count">{{ filteredAccounts.length }} / {{ config.Accounts.length }} 个账号</span>
+                                <div class="account-list-toolbar__actions">
+                                    <span class="account-list-toolbar__count">{{ filteredAccounts.length }} / {{ config.Accounts.length }} 个账号</span>
+                                    <button @click="openCreateAccountModal" class="ghost-button compact-button">新增账号</button>
+                                </div>
                             </div>
                             <div>
                                 <div class="account-row account-management-row summary-table-head">
@@ -5442,7 +5458,10 @@
                                 <app-select v-model="accountFilter.siteType" class="glass-select" :options="accountSiteOptions" />
                                 <input v-model.trim="accountFilter.search" class="glass-input" placeholder="搜索账号备注或区域">
                             </div>
-                            <span class="account-list-toolbar__count">{{ filteredAccounts.length }} / {{ config.Accounts.length }} 个账号</span>
+                            <div class="account-list-toolbar__actions">
+                                <span class="account-list-toolbar__count">{{ filteredAccounts.length }} / {{ config.Accounts.length }} 个账号</span>
+                                <button @click="openCreateAccountModal" class="ghost-button compact-button">新增账号</button>
+                            </div>
                         </div>
 
 						<div v-if="currentAccountTab === 'accounts'" class="mobile-stack" style="margin-top: 24px;">
