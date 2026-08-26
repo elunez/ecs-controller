@@ -5298,7 +5298,7 @@
                             <div v-if="currentSettingsTab === 'global'" class="metric-card space-y-4">
                                 <div>
                                     <p class="subtle-label">全局配置</p>
-                                    <h3 class="mt-1 text-lg font-bold">全局设置</h3>
+                                    <h3 class="mt-1 text-lg font-bold">全局配置</h3>
                                 </div>
                                 <div class="space-y-3">
                                     <div class="settings-brand-card rounded-[18px] border border-slate-200/70 bg-white/70 p-4">
@@ -5362,6 +5362,16 @@
                                         </label>
                                         <p v-if="passkeyCount === 0" class="mt-2 text-xs leading-5 text-amber-700">请先注册至少一个 Passkey，才能关闭密码登录。</p>
                                     </div>
+
+                                </div>
+                            </div>
+
+                            <div v-if="currentSettingsTab === 'instance'" class="metric-card space-y-4">
+                                <div>
+                                    <p class="subtle-label">实例配置</p>
+                                    <h3 class="mt-1 text-lg font-bold">实例配置</h3>
+                                </div>
+                                <div class="space-y-3">
                                     <div class="two-col-grid">
                                         <div>
                                             <label class="mb-2 block text-sm font-semibold text-[#6f7787]">告警阈值 (%)</label>
@@ -6970,12 +6980,12 @@
                 };
                 const savedNavigation = readNavigationState();
                 const validMenus = ['manage', 'groups', 'accounts', 'settings', 'logs', 'about'];
-                const validSettingsTabs = ['global', 'notifications'];
+                const validSettingsTabs = ['instance', 'notifications', 'global'];
                 const validNotifyTabs = ['telegram', 'email', 'webhook'];
                 const validLogTabs = ['action', 'heartbeat'];
                 const currentMenu = ref(validMenus.includes(savedNavigation.menu) ? savedNavigation.menu : 'manage');
                 const mobileNavHidden = ref(false);
-                const currentSettingsTab = ref(validSettingsTabs.includes(savedNavigation.settingsTab) ? savedNavigation.settingsTab : 'global');
+                const currentSettingsTab = ref(validSettingsTabs.includes(savedNavigation.settingsTab) ? savedNavigation.settingsTab : 'instance');
                 const currentNotifyTab = ref(validNotifyTabs.includes(savedNavigation.notifyTab) ? savedNavigation.notifyTab : 'telegram');
                 const currentLogTab = ref(validLogTabs.includes(savedNavigation.logTab) ? savedNavigation.logTab : 'action');
                 const passkeySecureContext = typeof window !== 'undefined' && (
@@ -7671,8 +7681,9 @@
                 };
 
                 const settingsItems = [
-                    { key: 'global', label: '全局设置', description: '运行参数、阈值与费用' },
-                    { key: 'notifications', label: '通知中心', description: '邮件、Telegram、回调' }
+                    { key: 'instance', label: '实例配置', description: '阈值、同步与费用' },
+                    { key: 'notifications', label: '通知中心', description: '邮件、Telegram、回调' },
+                    { key: 'global', label: '全局配置', description: '品牌、账号与安全' }
                 ];
 
                 const menuItems = computed(() => {
