@@ -2021,7 +2021,7 @@
 
 		.billing-analysis__grid {
 			display: grid;
-			grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+			grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 			gap: 10px;
 		}
 
@@ -2041,7 +2041,7 @@
 		}
 
 		.billing-analysis-card__numbers {
-			margin-top: 10px;
+			margin-top: 8px;
 			align-items: flex-start;
 		}
 
@@ -2056,6 +2056,44 @@
 			font-size: .72rem;
 			line-height: 1.55;
 			text-align: right;
+		}
+
+		.billing-analysis-card__summary-label {
+			color: var(--muted);
+			font-size: .7rem;
+			font-weight: 700;
+		}
+
+		.account-list-toolbar {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 10px;
+			padding: 10px 12px;
+			border-bottom: 1px solid var(--line);
+			background: color-mix(in srgb, var(--panel-strong) 56%, transparent);
+		}
+
+		.account-list-toolbar__filters {
+			display: grid;
+			grid-template-columns: minmax(150px, 210px) minmax(180px, 1fr);
+			gap: 8px;
+			width: min(100%, 480px);
+		}
+
+		.account-list-toolbar__count {
+			flex: 0 0 auto;
+			color: var(--muted);
+			font-size: .75rem;
+			font-variant-numeric: tabular-nums;
+			white-space: nowrap;
+		}
+
+		.account-list-empty {
+			padding: 28px 16px;
+			color: var(--muted);
+			font-size: .85rem;
+			text-align: center;
 		}
 
 		.billing-category-list {
@@ -4259,6 +4297,17 @@
 			.audit-toolbar {
 				grid-template-columns: 1fr;
 			}
+
+			.billing-analysis__head,
+			.account-list-toolbar {
+				align-items: stretch;
+				flex-direction: column;
+			}
+
+			.account-list-toolbar__filters {
+				grid-template-columns: 1fr;
+				width: 100%;
+			}
 		}
 
         .desktop-visible {
@@ -4463,6 +4512,10 @@
             .mobile-visible,
             .mobile-manage-grid {
                 display: grid;
+            }
+
+            .mobile-visible.account-list-toolbar {
+                display: flex;
             }
 
             .account-row {
@@ -5251,7 +5304,7 @@
 							<div class="billing-analysis__head">
 								<div>
 									<strong>本月费用分析</strong>
-									<p class="mt-1 text-xs text-[var(--muted)]">按云账号汇总；预测按本月日均消费计算，费用阈值仅通知。</p>
+									<p class="mt-1 text-xs text-[var(--muted)]">按站点和币种汇总；预测按本月日均消费计算，费用阈值仅通知。</p>
 								</div>
 								<button class="ghost-button compact-button" :disabled="billingAnalysisLoading" @click="fetchBillingAnalysis(true)">{{ billingAnalysisLoading ? '查询中' : '刷新费用' }}</button>
 							</div>
@@ -5259,9 +5312,12 @@
 							<div v-else-if="billingAnalysisError" class="text-sm text-red-600">{{ billingAnalysisError }}</div>
 							<div v-else-if="!billingAnalysis.accounts.length" class="text-sm text-[var(--muted)]">暂无可分析的云账号。</div>
 							<div v-else class="billing-analysis__grid">
-								<article v-for="item in billingAnalysis.accounts" :key="item.group_key" class="billing-analysis-card">
+								<article v-for="item in billingOverview" :key="item.key" class="billing-analysis-card">
 									<div class="billing-analysis-card__head">
-										<strong>{{ item.label }}</strong>
+										<div>
+											<strong>{{ item.label }}</strong>
+											<div class="billing-analysis-card__summary-label">{{ item.accountCount }} 个账号</div>
+										</div>
 										<span class="text-xs text-[var(--muted)]">{{ item.currency }}</span>
 									</div>
 									<div class="billing-analysis-card__numbers">
@@ -5284,8 +5340,12 @@
 						</div>
 
                         <div class="table-shell desktop-visible" style="margin-top: 10px;">
-                            <div class="bg-white/65 px-5 py-3 text-xs font-bold uppercase tracking-[0.18em] text-[var(--muted)]">
-                                列表模式
+                            <div class="account-list-toolbar">
+                                <div class="account-list-toolbar__filters">
+                                    <app-select v-model="accountFilter.siteType" class="glass-select" :options="accountSiteOptions" />
+                                    <input v-model.trim="accountFilter.search" class="glass-input" placeholder="搜索账号备注或区域">
+                                </div>
+                                <span class="account-list-toolbar__count">{{ filteredAccounts.length }} / {{ config.Accounts.length }} 个账号</span>
                             </div>
                             <div>
                                 <div class="account-row account-management-row summary-table-head">
@@ -5297,7 +5357,8 @@
                                     <div class="center-column">操作</div>
                                 </div>
 
-                                <div v-for="(acc, idx) in config.Accounts" :key="'account-row-' + idx" class="account-row account-management-row">
+                                <div v-for="entry in filteredAccounts" :key="'account-row-' + entry.index" class="account-row account-management-row">
+                                    <template v-for="acc in [entry.account]" :key="entry.index">
                                     <div class="summary-cell">
                                         <div class="summary-primary">{{ acc.remark || '未命名账号' }}</div>
                                         <div class="summary-secondary">实例会同步到这个备注名下</div>
@@ -5342,34 +5403,45 @@
 	                                    <div class="summary-cell center-column">
 	                                        <div>
 	                                        <div class="row-actions">
-	                                            <button @click="syncAccount(idx)" class="ghost-button compact-button sync-button"
-                                                    :class="getAccountSyncButtonClass(idx)"
-                                                    :disabled="isSyncingAccount(idx)">
-	                                                {{ getAccountSyncLabel(idx) }}
-	                                            </button>
-	                                            <button @click="openEditAccountModal(idx)" class="ghost-button compact-button">编辑</button>
-	                                            <button @click="removeAccountRow(idx)" class="danger-button compact-button">删除</button>
-	                                        </div>
-                                            <div v-if="getAccountSyncResult(idx)?.message" class="sync-note"
-                                                :class="{ error: !getAccountSyncResult(idx)?.success, success: getAccountSyncResult(idx)?.success }">
-                                                {{ getAccountSyncResult(idx)?.message }}
+                                            <button @click="syncAccount(entry.index)" class="ghost-button compact-button sync-button"
+                                                    :class="getAccountSyncButtonClass(entry.index)"
+                                                    :disabled="isSyncingAccount(entry.index)">
+                                                {{ getAccountSyncLabel(entry.index) }}
+                                            </button>
+                                            <button @click="openEditAccountModal(entry.index)" class="ghost-button compact-button">编辑</button>
+                                            <button @click="removeAccountRow(entry.index)" class="danger-button compact-button">删除</button>
+                                        </div>
+                                            <div v-if="getAccountSyncResult(entry.index)?.message" class="sync-note"
+                                                :class="{ error: !getAccountSyncResult(entry.index)?.success, success: getAccountSyncResult(entry.index)?.success }">
+                                                {{ getAccountSyncResult(entry.index)?.message }}
                                             </div>
                                             </div>
 	                                    </div>
+	                                    </template>
 	                                </div>
 
-                                <div v-if="config.Accounts.length === 0" class="account-row">
-                                    <div class="summary-cell" style="grid-column: 1 / -1; text-align: center; color: var(--muted);">
-                                        还没有账号，点击“新增账号”开始配置。
-                                    </div>
+                                <div v-if="config.Accounts.length === 0" class="account-list-empty">
+                                    还没有账号，点击“新增账号”开始配置。
+                                </div>
+                                <div v-else-if="filteredAccounts.length === 0" class="account-list-empty">
+                                    没有匹配的账号。
                                 </div>
                             </div>
                         </div>
 
+                        <div class="mobile-visible account-list-toolbar" style="margin-top: 10px;">
+                            <div class="account-list-toolbar__filters">
+                                <app-select v-model="accountFilter.siteType" class="glass-select" :options="accountSiteOptions" />
+                                <input v-model.trim="accountFilter.search" class="glass-input" placeholder="搜索账号备注或区域">
+                            </div>
+                            <span class="account-list-toolbar__count">{{ filteredAccounts.length }} / {{ config.Accounts.length }} 个账号</span>
+                        </div>
+
                         <div class="mobile-stack" style="margin-top: 24px;">
-                            <article v-for="(acc, idx) in config.Accounts" :key="'account-card-' + idx" class="metric-card">
+                            <article v-for="entry in filteredAccounts" :key="'account-card-' + entry.index" class="metric-card">
+                                <template v-for="acc in [entry.account]" :key="entry.index">
                                 <div class="flex items-center justify-between">
-                                    <h3 class="text-base font-bold">{{ acc.remark || `账号 ${idx + 1}` }}</h3>
+                                    <h3 class="text-base font-bold">{{ acc.remark || `账号 ${entry.index + 1}` }}</h3>
                                     <span class="text-xs text-[var(--muted)]">{{ acc.instanceCount || 0 }} 台实例</span>
                                 </div>
                                 <div class="account-card-grid">
@@ -5402,23 +5474,27 @@
                                     <div v-else class="account-billing__hint">消费情况：未启用 费用中心</div>
 	                                </div>
 	                                <div class="row-actions" style="margin-top: 16px;">
-	                                    <button @click="syncAccount(idx)" class="ghost-button !px-3 !py-2 sync-button"
-                                            :class="getAccountSyncButtonClass(idx)"
-                                            :disabled="isSyncingAccount(idx)">
-	                                        {{ getAccountSyncLabel(idx) }}
+	                                    <button @click="syncAccount(entry.index)" class="ghost-button !px-3 !py-2 sync-button"
+                                            :class="getAccountSyncButtonClass(entry.index)"
+                                            :disabled="isSyncingAccount(entry.index)">
+	                                        {{ getAccountSyncLabel(entry.index) }}
 	                                    </button>
-	                                    <button @click="openEditAccountModal(idx)" class="ghost-button !px-3 !py-2">编辑</button>
-	                                    <button @click="removeAccountRow(idx)" class="danger-button !px-3 !py-2">删除</button>
+	                                    <button @click="openEditAccountModal(entry.index)" class="ghost-button !px-3 !py-2">编辑</button>
+	                                    <button @click="removeAccountRow(entry.index)" class="danger-button !px-3 !py-2">删除</button>
 	                                </div>
-                                    <div v-if="getAccountSyncResult(idx)?.message" class="sync-note"
-                                        :class="{ error: !getAccountSyncResult(idx)?.success, success: getAccountSyncResult(idx)?.success }">
-                                        {{ getAccountSyncResult(idx)?.message }}
+                                    <div v-if="getAccountSyncResult(entry.index)?.message" class="sync-note"
+                                        :class="{ error: !getAccountSyncResult(entry.index)?.success, success: getAccountSyncResult(entry.index)?.success }">
+                                        {{ getAccountSyncResult(entry.index)?.message }}
                                     </div>
+                                </template>
                             </article>
 
                             <div v-if="config.Accounts.length === 0" class="metric-card">
                                 <p class="text-center text-sm text-[var(--muted)]">还没有账号，点击“新增账号”开始配置。</p>
                             </div>
+	                        <div v-else-if="filteredAccounts.length === 0" class="metric-card">
+	                            <p class="text-center text-sm text-[var(--muted)]">没有匹配的账号。</p>
+	                        </div>
                         </div>
                     </section>
 
@@ -7503,6 +7579,12 @@
 
                 const manageFilter = ref({ account: '', region: '', status: '', search: '' });
                 const rotationGroupSearch = ref('');
+				const accountFilter = ref({ siteType: '', search: '' });
+				const accountSiteOptions = [
+					{ value: '', label: '全部站点' },
+					{ value: 'china', label: '中国站' },
+					{ value: 'international', label: '国际站' }
+				];
                 let logInterval = null;
                 let manageInterval = null;
                 let accountInterval = null;
@@ -7515,6 +7597,59 @@
                 };
 
                 const getSiteTypeLabel = (siteType) => siteType === 'international' ? '国际站' : '中国站';
+				const filteredAccounts = computed(() => {
+					const search = accountFilter.value.search.trim().toLowerCase();
+					return (config.value.Accounts || []).map((account, index) => ({ account, index })).filter(({ account }) => {
+						if (accountFilter.value.siteType && account.siteType !== accountFilter.value.siteType) return false;
+						if (!search) return true;
+						return [
+							account.remark,
+							account.regionId,
+							getRegionName(account.regionId),
+							getSiteTypeLabel(account.siteType)
+						].some((value) => String(value || '').toLowerCase().includes(search));
+					});
+				});
+				const billingOverview = computed(() => {
+					const daysElapsed = Math.max(1, Number(billingAnalysis.value.daysElapsed || new Date().getDate()));
+					const groups = new Map();
+					(billingAnalysis.value.accounts || []).forEach((account) => {
+						const siteType = account.site_type === 'international' ? 'international' : 'china';
+						const currency = account.currency || (siteType === 'international' ? 'USD' : 'CNY');
+						const key = `${siteType}:${currency}`;
+						if (!groups.has(key)) {
+							groups.set(key, {
+								key,
+								siteType,
+								label: getSiteTypeLabel(siteType),
+								currency,
+								accountCount: 0,
+								monthly_cost: 0,
+								forecast: 0,
+								balance: 0,
+								categories: [],
+								categoryAmounts: new Map()
+							});
+						}
+						const item = groups.get(key);
+						item.accountCount += 1;
+						item.monthly_cost += Number(account.monthly_cost || 0);
+						item.forecast += Number(account.forecast || 0);
+						item.balance += Number(account.balance || 0);
+						(account.categories || []).forEach((category) => {
+							const current = item.categoryAmounts.get(category.key) || { key: category.key, label: category.label, amount: 0 };
+							current.amount += Number(category.amount || 0);
+							item.categoryAmounts.set(category.key, current);
+						});
+					});
+					return [...groups.values()].map((item) => {
+						item.categories = [...item.categoryAmounts.values()].filter((category) => category.amount !== 0);
+						const dailyAverage = item.monthly_cost / daysElapsed;
+						item.available_days = dailyAverage > 0 ? item.balance / dailyAverage : null;
+						delete item.categoryAmounts;
+						return item;
+					}).sort((left, right) => left.siteType.localeCompare(right.siteType));
+				});
                 const formatTrafficUsage = (value) => Number(value || 0).toFixed(2).replace(/\.00$/, '');
                 const formatBillingNumber = (value) => {
                     const number = Number(value);
@@ -8117,6 +8252,7 @@
 						billingAnalysis.value = {
 							enabled: data.enabled === true,
 							cycle: data.cycle || '',
+							daysElapsed: Number(data.days_elapsed || new Date().getDate()),
 							summary: data.summary || {},
 							accounts: Array.isArray(data.accounts) ? data.accounts : []
 						};
@@ -10224,6 +10360,7 @@
 					billingAnalysis,
 					billingAnalysisLoading,
 					billingAnalysisError,
+					billingOverview,
 					fetchBillingAnalysis,
 					formatAvailableDays,
                     runtimeStatus,
@@ -10286,6 +10423,9 @@
                     passkeyBusy,
                     manageFilter,
                     rotationGroupSearch,
+					accountFilter,
+					accountSiteOptions,
+					filteredAccounts,
                     accountOptions,
                     usernameInput,
                     passwordInput,
