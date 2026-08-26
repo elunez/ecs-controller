@@ -68,7 +68,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           if [[ -z "$ECS_RELEASE_SIGNING_KEY" ]]; then
-            echo "缺少 ECS_RELEASE_SIGNING_KEY，拒绝发布未签名版本。" >&2
+            echo "缺少 ECS_RELEASE_SIGNING_KEY，拒绝发布未签名版本。请在 Settings -> Secrets and variables -> Actions 中配置与 internal/app/release-public-key.pem 匹配的完整 Ed25519 PEM 私钥。" >&2
             exit 1
           fi
           release_dir="$RUNNER_TEMP/ecs-controller-release"
