@@ -4223,6 +4223,10 @@
             align-items: center;
         }
 
+        .top-action-row .tab-pill-group {
+            margin-bottom: 0;
+        }
+
         .muted-text {
             color: var(--muted);
         }
@@ -5296,11 +5300,15 @@
                                 <p class="mt-1 text-sm text-slate-500">账号通过弹窗维护。每次新增或编辑保存后，会自动同步该账号在所选区域下的全部实例，并把备注一并带到实例卡片中。</p>
                             </div>
                             <div class="top-action-row">
+                                <div class="tab-pill-group">
+                                    <button @click="currentAccountTab = 'accounts'" class="ghost-button" :class="{ 'text-dark-button': currentAccountTab === 'accounts' }">账号管理</button>
+                                    <button v-if="config.enable_billing" @click="currentAccountTab = 'billing'; fetchBillingAnalysis(false)" class="ghost-button" :class="{ 'text-dark-button': currentAccountTab === 'billing' }">费用分析</button>
+                                </div>
                                 <button @click="openCreateAccountModal" class="ghost-button">新增账号</button>
                             </div>
                         </div>
 
-						<div v-if="config.enable_billing" class="billing-analysis">
+						<div v-if="currentAccountTab === 'billing' && config.enable_billing" class="billing-analysis">
 							<div class="billing-analysis__head">
 								<div>
 									<strong>本月费用分析</strong>
@@ -5339,7 +5347,7 @@
 							</div>
 						</div>
 
-                        <div class="table-shell desktop-visible" style="margin-top: 10px;">
+						<div v-if="currentAccountTab === 'accounts'" class="table-shell desktop-visible" style="margin-top: 10px;">
                             <div class="account-list-toolbar">
                                 <div class="account-list-toolbar__filters">
                                     <app-select v-model="accountFilter.siteType" class="glass-select" :options="accountSiteOptions" />
@@ -5429,7 +5437,7 @@
                             </div>
                         </div>
 
-                        <div class="mobile-visible account-list-toolbar" style="margin-top: 10px;">
+						<div v-if="currentAccountTab === 'accounts'" class="mobile-visible account-list-toolbar" style="margin-top: 10px;">
                             <div class="account-list-toolbar__filters">
                                 <app-select v-model="accountFilter.siteType" class="glass-select" :options="accountSiteOptions" />
                                 <input v-model.trim="accountFilter.search" class="glass-input" placeholder="搜索账号备注或区域">
@@ -5437,7 +5445,7 @@
                             <span class="account-list-toolbar__count">{{ filteredAccounts.length }} / {{ config.Accounts.length }} 个账号</span>
                         </div>
 
-                        <div class="mobile-stack" style="margin-top: 24px;">
+						<div v-if="currentAccountTab === 'accounts'" class="mobile-stack" style="margin-top: 24px;">
                             <article v-for="entry in filteredAccounts" :key="'account-card-' + entry.index" class="metric-card">
                                 <template v-for="acc in [entry.account]" :key="entry.index">
                                 <div class="flex items-center justify-between">
@@ -7347,6 +7355,7 @@
                 const currentSettingsTab = ref(validSettingsTabs.includes(savedNavigation.settingsTab) ? savedNavigation.settingsTab : 'instance');
                 const currentNotifyTab = ref(validNotifyTabs.includes(savedNavigation.notifyTab) ? savedNavigation.notifyTab : 'telegram');
                 const currentLogTab = ref(validLogTabs.includes(savedNavigation.logTab) ? savedNavigation.logTab : 'action');
+				const currentAccountTab = ref('accounts');
                 const passkeySecureContext = typeof window !== 'undefined' && (
                     window.isSecureContext || ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname)
                 );
@@ -8232,6 +8241,9 @@
                         const res = await fetch('index.php?action=get_config');
                         const data = await res.json();
                         config.value = normalizeConfig(data);
+						if (!config.value.enable_billing && currentAccountTab.value === 'billing') {
+							currentAccountTab.value = 'accounts';
+						}
                         passwordLoginEnabled.value = data.password_login_enabled !== false;
                         passkeyCount.value = Number(data.passkey_count || 0);
                         passkeyAvailable.value = passkeyCount.value > 0;
@@ -10177,9 +10189,6 @@
 
                     if (menu === 'accounts' && isAdmin.value) {
 						await fetchConfig();
-						if (config.value.enable_billing) {
-							await fetchBillingAnalysis(false);
-						}
                         startAccountPolling();
                     } else {
                         stopAccountPolling();
@@ -10381,6 +10390,7 @@
                     brandLogoUrl,
                     cronWarning,
                     criticalError,
+					currentAccountTab,
                     currentLogTab,
                     currentMenu,
                     mobileNavHidden,
