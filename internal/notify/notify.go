@@ -38,7 +38,8 @@ func NewTelegramClient(token, proxyType, customURL, proxyHost, proxyPort, proxyU
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("Telegram token 不能为空")
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	// 不设全局 Timeout，由每次调用的 context 控制超时，避免 getUpdates 长轮询被截断
+	client := &http.Client{}
 	if proxyType == "custom" && strings.TrimSpace(customURL) != "" {
 		base := strings.TrimRight(customURL, "/")
 		return &TelegramClient{Token: token, BaseURL: base, HTTPClient: client}, nil
@@ -65,6 +66,12 @@ func auth(user, password string) *proxy.Auth {
 func (c *TelegramClient) Call(ctx context.Context, method string, values url.Values) (TelegramResponse, error) {
 	if c == nil || c.Token == "" {
 		return TelegramResponse{}, fmt.Errorf("Telegram token 不能为空")
+	}
+	// 如果调用方没有设置 deadline，给一个 30 秒的默认超时兜底
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/bot"+c.Token+"/"+method, strings.NewReader(values.Encode()))
 	if err != nil {
@@ -133,8 +140,12 @@ func (c *TelegramClient) AnswerCallback(ctx context.Context, id, message string)
 }
 
 func (c *TelegramClient) GetUpdates(ctx context.Context, offset int64) ([]map[string]any, error) {
-	values := url.Values{"offset": {strconv.FormatInt(offset, 10)}, "limit": {"20"}, "timeout": {"20"}, "allowed_updates": {`["message","callback_query"]`}}
-	response, err := c.Call(ctx, "getUpdates", values)
+	const pollTimeout = 20 // Telegram 服务端长轮询等待秒数
+	values := url.Values{"offset": {strconv.FormatInt(offset, 10)}, "limit": {"20"}, "timeout": {strconv.Itoa(pollTimeout)}, "allowed_updates": {`["message","callback_query"]`}}
+	// 客户端超时 = 服务端长轮询时间 + 15 秒网络缓冲，防止代理或慢网络导致 Client.Timeout 截断
+	pollCtx, cancel := context.WithTimeout(ctx, time.Duration(pollTimeout+15)*time.Second)
+	defer cancel()
+	response, err := c.Call(pollCtx, "getUpdates", values)
 	if err != nil {
 		return nil, err
 	}

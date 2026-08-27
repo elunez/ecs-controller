@@ -7647,14 +7647,19 @@
 				});
 				const billingOverview = computed(() => {
 					const daysElapsed = Math.max(1, Number(billingAnalysis.value.daysElapsed || new Date().getDate()));
+					const accountOrder = new Map((config.value.Accounts || []).map((account, index) => [account.groupKey, index]));
 					const groups = new Map();
-					(billingAnalysis.value.accounts || []).forEach((account) => {
+					(billingAnalysis.value.accounts || []).forEach((account, accountIndex) => {
 						const siteType = account.site_type === 'international' ? 'international' : 'china';
 						const currency = account.currency || (siteType === 'international' ? 'USD' : 'CNY');
 						const key = `${siteType}:${currency}`;
+						const order = accountOrder.has(account.group_key)
+							? accountOrder.get(account.group_key)
+							: accountOrder.size + accountIndex;
 						if (!groups.has(key)) {
 							groups.set(key, {
 								key,
+								order,
 								siteType,
 								label: getSiteTypeLabel(siteType),
 								currency,
@@ -7667,6 +7672,7 @@
 							});
 						}
 						const item = groups.get(key);
+						item.order = Math.min(item.order, order);
 						item.accountCount += 1;
 						item.monthly_cost += Number(account.monthly_cost || 0);
 						item.forecast += Number(account.forecast || 0);
@@ -7683,7 +7689,7 @@
 						item.available_days = dailyAverage > 0 ? item.balance / dailyAverage : null;
 						delete item.categoryAmounts;
 						return item;
-					}).sort((left, right) => left.siteType.localeCompare(right.siteType));
+					}).sort((left, right) => left.order - right.order);
 				});
                 const formatTrafficUsage = (value) => Number(value || 0).toFixed(2).replace(/\.00$/, '');
                 const formatBillingNumber = (value) => {
