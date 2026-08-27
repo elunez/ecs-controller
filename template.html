@@ -567,18 +567,6 @@
             backdrop-filter: blur(14px);
         }
 
-        .toast-card::before {
-            position: absolute;
-            top: 0;
-            right: 18px;
-            left: 18px;
-            height: 2px;
-            border-radius: 0 0 999px 999px;
-            background: var(--accent);
-            box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 32%, transparent);
-            content: "";
-        }
-
         .toast-card__status {
             display: inline-flex;
             align-items: center;
@@ -620,11 +608,6 @@
             color: var(--success);
         }
 
-        .toast-card.success::before {
-            background: var(--success);
-            box-shadow: 0 2px 8px color-mix(in srgb, var(--success) 32%, transparent);
-        }
-
         .toast-card.error .toast-status-dot {
             background: var(--danger);
             box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 12%, transparent);
@@ -632,11 +615,6 @@
 
         .toast-card.error .toast-title {
             color: var(--danger);
-        }
-
-        .toast-card.error::before {
-            background: var(--danger);
-            box-shadow: 0 2px 8px color-mix(in srgb, var(--danger) 32%, transparent);
         }
 
         .toast-enter-active,
@@ -4972,10 +4950,11 @@
                                 <svg v-if="!passwordVisible.login" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.75"/></svg>
                                 <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m3 3 18 18"/><path d="M10.7 6.1A10.8 10.8 0 0 1 12 6c6 0 9.5 6 9.5 6a17.5 17.5 0 0 1-2.1 2.8M6.2 6.2C3.8 7.8 2.5 12 2.5 12s3.5 6 9.5 6c1.5 0 2.8-.4 4-.9"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>
                             </button>
-                        </div>
-                        <div class="login-gate-actions flex">
-                            <button @click="performLogin" class="solid-button flex-1">登录</button>
-                        </div>
+                       </div>
+                       <div class="login-gate-actions">
+                            <label class="flex items-center gap-2 text-sm text-[var(--muted)] cursor-pointer select-none"><input type="checkbox" v-model="autoLogin" class="accent-[var(--accent)]"> 记住我</label>
+                            <button @click="performLogin" class="solid-button w-full mt-3">登录</button>
+                       </div>
                     </div>
                     <div v-if="passkeyAvailable" class="passkey-login-option">
                         <div class="passkey-login-option__rule"><span>或</span></div>
@@ -7356,8 +7335,9 @@
                 const showLoginModal = ref(false);
                 const usernameInput = ref('');
                 const passwordInput = ref('');
-                const passwordVisible = ref({ login: false, setup: false, settings: false });
-                const criticalError = ref(null);
+               const passwordVisible = ref({ login: false, setup: false, settings: false });
+                const autoLogin = ref(!!window.localStorage.getItem('ecs-auto-login'));
+               const criticalError = ref(null);
                 const isAdmin = ref(false);
                 const cronWarning = ref(false);
                 let bootstrappingAdmin = false;
@@ -10064,12 +10044,17 @@
                             method: 'POST',
                             body: JSON.stringify({ username: usernameInput.value, password: passwordInput.value })
                         });
-                        const data = await res.json();
-                        if (!data.success) {
-                            openAlert(data.message || '登录失败', 'error');
-                            return;
+                       const data = await res.json();
+                       if (!data.success) {
+                           openAlert(data.message || '登录失败', 'error');
+                           return;
+                       }
+                        if (autoLogin.value) {
+                            try { window.localStorage.setItem('ecs-auto-login', JSON.stringify({ u: usernameInput.value, p: btoa(passwordInput.value) })); } catch (_) {}
+                        } else {
+                            window.localStorage.removeItem('ecs-auto-login');
                         }
-                        usernameInput.value = '';
+                       usernameInput.value = '';
                         passwordInput.value = '';
                         passwordVisible.value.login = false;
                         showLoginModal.value = false;
@@ -10088,8 +10073,10 @@
                         return;
                     }
 
-                    await fetch('index.php?action=logout');
-                    isAdmin.value = false;
+                   await fetch('index.php?action=logout');
+                    window.localStorage.removeItem('ecs-auto-login');
+                    autoLogin.value = false;
+                   isAdmin.value = false;
                     currentMenu.value = 'manage';
                     config.value = createDefaultConfig();
                     configBaseline.value = '';
@@ -10125,9 +10112,24 @@
                     try {
                         const res = await fetch('index.php?action=check_login');
                         const data = await res.json();
-                        csrfToken = data.logged_in ? (data.csrf_token || '') : '';
-                        isAdmin.value = !!data.logged_in;
-                    } catch (error) {
+                       csrfToken = data.logged_in ? (data.csrf_token || '') : '';
+                       isAdmin.value = !!data.logged_in;
+                        if (!isAdmin.value) {
+                            try {
+                                const saved = window.localStorage.getItem('ecs-auto-login');
+                                if (saved) {
+                                    const cred = JSON.parse(saved);
+                                    const lr = await fetch('index.php?action=login', { method: 'POST', body: JSON.stringify({ username: cred.u, password: atob(cred.p) }) });
+                                   const ld = await lr.json();
+                                   if (ld.success) {
+                                       isAdmin.value = true;
+                                    } else {
+                                        window.localStorage.removeItem('ecs-auto-login');
+                                    }
+                                }
+                            } catch (_) {}
+                        }
+                   } catch (error) {
                         console.error('Session check failed', error);
                     } finally {
                         checkingLogin.value = false;
@@ -10471,8 +10473,9 @@
                     accountOptions,
                     usernameInput,
                     passwordInput,
-                    passwordVisible,
-                    reloadPage,
+                   passwordVisible,
+                    autoLogin,
+                   reloadPage,
                     savingAccountModal,
                     savingRotationGroup,
                     savingInstanceSchedule,
