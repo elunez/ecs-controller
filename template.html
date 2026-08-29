@@ -2576,7 +2576,6 @@
         }
 
        .passkey-login-option {
-           margin-top: 18px;
             text-align: center;
        }
 
@@ -4957,7 +4956,7 @@
                             <button @click="performLogin" class="solid-button w-full mt-3">登录</button>
                        </div>
                     </div>
-                   <div v-if="passkeyAvailable" class="passkey-login-option">
+                    <div v-if="passkeyAvailable" class="passkey-login-option" :class="passwordLoginEnabled ? 'mt-5' : 'mt-3'">
                         <div v-if="passwordLoginEnabled" class="passkey-login-option__rule"><span>或</span></div>
                         <button v-if="passkeySupported" @click="loginWithPasskey" class="ghost-button full-width-button" :disabled="passkeyBusy">
                             {{ passkeyBusy ? '验证中...' : '使用 Passkey 登录' }}
