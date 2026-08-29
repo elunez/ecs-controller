@@ -2530,6 +2530,7 @@
             max-width: 440px;
             border-radius: 24px;
             padding: 30px;
+            animation: modal-rise .2s ease both;
         }
 
         .login-gate-actions {
@@ -4960,8 +4961,8 @@
                         <button v-if="passkeySupported" @click="loginWithPasskey" class="ghost-button full-width-button" :disabled="passkeyBusy">
                             {{ passkeyBusy ? '验证中...' : '使用 Passkey 登录' }}
                         </button>
-                        <p v-if="passkeySupported" class="mt-2 text-center text-xs leading-5 text-[var(--muted)]">使用设备指纹、面容或安全密钥，无需输入管理员密码。</p>
-                        <p v-else class="mt-2 text-center text-xs leading-5 text-amber-700">{{ passkeySupportHint }}</p>
+                        <p v-if="passkeySupported" class="mt-3 text-center text-xs leading-5 text-[var(--muted)]">使用设备指纹、面容或安全密钥，无需输入管理员密码。</p>
+                        <p v-else class="mt-3 text-center text-xs leading-5 text-amber-700">{{ passkeySupportHint }}</p>
                     </div>
                     <div v-if="!passwordLoginEnabled && !passkeyAvailable" class="mt-6 rounded-[18px] border border-red-200 bg-red-50/80 px-4 py-3 text-sm leading-6 text-red-700">
                         当前没有可用的 Passkey，请联系管理员恢复密码登录。
