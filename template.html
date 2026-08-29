@@ -2575,9 +2575,10 @@
             height: 18px;
         }
 
-        .passkey-login-option {
-            margin-top: 18px;
-        }
+       .passkey-login-option {
+           margin-top: 18px;
+            text-align: center;
+       }
 
         .passkey-login-option__rule {
             display: flex;
@@ -4958,7 +4959,7 @@
                     </div>
                     <div v-if="passkeyAvailable" class="passkey-login-option">
                         <div class="passkey-login-option__rule"><span>或</span></div>
-                        <button v-if="passkeySupported" @click="loginWithPasskey" class="ghost-button full-width-button mx-auto block" :disabled="passkeyBusy">
+                        <button v-if="passkeySupported" @click="loginWithPasskey" class="ghost-button full-width-button" :disabled="passkeyBusy">
                             {{ passkeyBusy ? '验证中...' : '使用 Passkey 登录' }}
                         </button>
                         <p v-if="passkeySupported" class="mt-2 text-center text-xs leading-5 text-[var(--muted)]">使用设备指纹、面容或安全密钥，无需输入管理员密码。</p>
