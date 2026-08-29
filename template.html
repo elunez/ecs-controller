@@ -4928,7 +4928,7 @@
                             <h2 class="auth-brand__title">管理员登录</h2>
                         </div>
                     </div>
-                    <p class="auth-brand__lead">{{ passwordLoginEnabled ? '登录后查看实例状态、流量用量、定时策略和系统日志。' : '密码登录已关闭，请使用 Passkey 验证后进入控制台。' }}</p>
+                    <p class="auth-brand__lead">登录后查看实例状态、流量用量、定时策略和系统日志。</p>
                     <div v-if="passwordLoginEnabled">
                         <input
                             v-model="usernameInput"
@@ -4957,8 +4957,8 @@
                             <button @click="performLogin" class="solid-button w-full mt-3">登录</button>
                        </div>
                     </div>
-                    <div v-if="passkeyAvailable" class="passkey-login-option">
-                        <div class="passkey-login-option__rule"><span>或</span></div>
+                   <div v-if="passkeyAvailable" class="passkey-login-option">
+                        <div v-if="passwordLoginEnabled" class="passkey-login-option__rule"><span>或</span></div>
                         <button v-if="passkeySupported" @click="loginWithPasskey" class="ghost-button full-width-button" :disabled="passkeyBusy">
                             {{ passkeyBusy ? '验证中...' : '使用 Passkey 登录' }}
                         </button>
